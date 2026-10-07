@@ -1,0 +1,84 @@
+name: linux
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  perl:
+    env:
+      # some plugins still need this to run their tests...
+      PERL_USE_UNSAFE_INC: 0
+      AUTHOR_TESTING: 1
+      AUTOMATED_TESTING: 1
+      EXTENDED_TESTING: 1
+      RELEASE_TESTING: 1
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - 'latest'
+          - '5.40'
+          - '5.34'
+          - '5.28'
+          # - '5.20' No dzil
+          # - '5.18' No dzil
+          # - '5.16' No dzil
+          # - '5.14' No dzil
+          # - '5.10' No dzil
+
+    container:
+      image: perldocker/perl-tester:${{ matrix.perl-version }}
+      # https://hub.docker.com/r/perldocker/perl-tester
+      # https://github.com/Perl/docker-perl-tester
+
+    steps:
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v7
+      - id: explore-tools-perl
+        name: perl -V
+        run: perl -V
+      - id: explore-environment
+        name: Explore Environment
+        run: |
+          env
+      # - name: Install Dependencies
+      #   #run: cpm install -g --no-test --show-build-log-on-failure --cpanfile cpanfile
+      #   run: cpm install -g --no-test --show-build-log-on-failure --cpanfile cpanfile
+      # - name: Makefile.PL
+      #   run: perl Makefile.PL
+      - id: list-dzil-authordeps-with-verbosity
+        name: List Dist::Zilla Author Dependencies With Verbosity
+        run: |
+          dzil --verbose authordeps --cpanm-versions
+      - id: install-dzil-authordeps
+        name: Install Dist::Zilla Author Dependencies
+        run: |
+          dzil --verbose authordeps --cpanm-versions \
+          | cpanm --verbose --force --notest
+      - id: list-deps-with-verbosity
+        name: List Dependencies With Verbosity
+        run: |
+          dzil --verbose listdeps --requires --develop recommends --suggests --cpanm-version --omit-core "$(perl -E 'say $];')"
+        shell: bash
+      - id: install-dzil-deps
+        name: Install Dependencies
+        run: |
+          dzil listdeps --requires --develop recommends --suggests --cpanm-version --omit-core "$(perl -E 'say $];')" \
+          | cpanm --verbose --force --notest || true
+        shell: bash
+      # - id: build-project-and-explore
+      #   name: Build Project And Explore
+      #   run: |
+      #     dzil --verbose build \
+      #     && tree -af -I '\.git'
+      - id: run-test-suite
+        name: Run Tests
+        run: dzil --verbose test --all --test-verbose

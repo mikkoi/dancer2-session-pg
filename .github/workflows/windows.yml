@@ -1,0 +1,134 @@
+name: windows
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v7
+
+      - id: setup-strawberry-perl
+        name: Setup Strawberry Perl
+        uses: shogo82148/actions-setup-perl@v1.44.0
+        with:
+          perl-version: '5.42'
+          distribution: strawberry # Critical for Windows compatibility
+
+      - id: explore-tools-perl
+        name: Explore Tools Perl
+        shell: pwsh
+        run: |
+          perl -V
+
+      - id: explore-tools-cpan
+        name: Explore Tools Cpan
+        shell: pwsh
+        run: |
+          cpan -V
+
+      - id: explore-filesystem
+        name: Explore Filesystem
+        shell: pwsh
+        run: |
+          dir
+          dir C:\
+          dir C:\Users
+          dir C:/Strawberry/perl/site/lib
+          dir ..
+          dir ..\..
+          dir D:\
+          # dir .cpan
+          # dir .cpan\build
+
+      - id: explore-whoami
+        name: Explore Who Am I
+        shell: pwsh
+        run: |
+          whoami
+
+      - id: explore-environment
+        name: Explore Environment
+        shell: pwsh
+        run: |
+          Get-ChildItem env: | Format-Table -Wrap
+
+      - id: install-test2
+        name: Install Test2
+        shell: pwsh
+        run: |
+          cpanm --notest --force Test2::Suite
+
+      - id: install-dist-zilla
+        name: Install Dist::Zilla
+        shell: pwsh
+        run: |
+          cpanm --notest --force Dist::Zilla
+
+      - id: explore-missing-dzil-authordeps
+        name: Explore Missing Dist::Zilla Author Dependencies
+        shell: pwsh
+        run: |
+          dzil authordeps --missing --cpanm-versions
+
+      - id: install-missing-dzil-authordeps
+        name: Install Missing Dist::Zilla Author Dependencies
+        shell: pwsh
+        run: |
+          $authDeps = dzil authordeps --missing --cpanm-versions
+          if ($authDeps) {
+            Write-Host "Installing missing author dependencies: $authDeps"
+            $authDeps | cpanm --verbose --force --notest
+            if ($LASTEXITCODE -eq 1) {
+              Write-Host "cpanm returned 1, but checking if work got done..."
+              $authDepsCheck = dzil authordeps --missing
+            #   if ($authDepsCheck | ) {
+            #     Write-Host "Work got done successfully despite exit code 1."
+            #     $global:LASTEXITCODE = 0
+            #   }
+            }
+            $global:LASTEXITCODE = 0
+
+          } else {
+              Write-Host "No missing author dependencies found."
+          }
+
+      - id: explore-missing-deps
+        name: Explore Missing Dependencies
+        shell: pwsh
+        run: |
+          dzil listdeps --missing --develop --requires --no-recommends --no-suggests --cpanm-version
+
+      - id: install-missing-deps
+        name: Install Missing Dependencies
+        shell: pwsh
+        run: |
+          $listDeps = dzil listdeps --missing --develop --requires --no-recommends --no-suggests --cpanm-version
+          if ($listDeps) {
+            Write-Host "Installing missing dependencies: $listDeps"
+            $listDeps | cpanm --verbose --force --notest
+            if ($LASTEXITCODE -eq 1) {
+              Write-Host "cpanm returned 1, but checking if work got done..."
+              dzil listdeps --missing --develop --requires  --no-recommends --no-suggests
+            #   if ($?) {
+            #     Write-Host "Work got done successfully despite exit code 1."
+            #     $global:LASTEXITCODE = 0
+            #   }
+            }
+            $global:LASTEXITCODE = 0
+          } else {
+            Write-Host "No missing dependencies found."
+          }
+
+      - id: run-tests
+        name: Run Tests
+        shell: pwsh
+        run: |
+          dzil test --no-author
