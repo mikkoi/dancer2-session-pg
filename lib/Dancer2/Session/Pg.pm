@@ -802,6 +802,34 @@ sub destroy_for_principal {
     return 0 + $self->_dbh->do( "DELETE FROM $table WHERE $column = ?", undef, $principal );
 }
 
+# THE OTHER HALF OF sessions(). _sessions returns what the id column holds,
+# which is a digest, and Dancer2::Core::Role::SessionFactory documents those
+# values as the input to a cleaning script. Hashing is what breaks that: handing
+# a digest back to destroy() would hash it a second time and match no row, so
+# the script would report success having deleted nothing.
+#
+# So the pair is explicit rather than clever. destroy() takes a session id and
+# hashes it; this takes a value the id column already holds and does not. Each
+# method has ONE input language, and passing the wrong one croaks instead of
+# quietly doing nothing.
+#
+# Deliberately NOT a shape check inside destroy(): a digest is 64 hex characters
+# and a Dancer2 id is 32 base64url ones, so they cannot collide today -- but
+# generate_id is overridable, and a heuristic in the main delete path would turn
+# somebody's custom id format into a silent no-op. A separate method cannot.
+sub destroy_row {
+    my ( $self, $row_id ) = @_;
+
+    croak 'Dancer2::Session::Pg: destroy_row needs a row id from sessions() or '
+      . 'sessions_for_principal() -- 64 hex characters. To delete by SESSION id, '
+      . 'which is what a cookie holds, use destroy() instead'
+      if !defined $row_id
+      || $row_id !~ m/\A[0-9a-f]{64}\z/msx;    ## no critic (RegularExpressions::ProhibitEnumeratedClasses) -- sha256_hex output is ASCII lower-case hex; [[:xdigit:]] is Unicode-aware and allows A-F
+
+    my $table = $self->_table;
+    return 0 + $self->_dbh->do( "DELETE FROM $table WHERE id = ?", undef, $row_id );
+}
+
 sub sessions_for_principal {
     my ( $self, $principal ) = @_;
     $self->_require_principal('sessions_for_principal');
@@ -896,9 +924,10 @@ version 0.001
     );
 
 Most applications configure this from F<config.yml> rather than in Perl -- see
-L</A configuration file>. Installing the engine by hand is for when C<dbh> has to
+L<Dancer2::Session::Pg/A configuration file>. Installing the engine by hand is
+for when C<dbh> has to
 be a coderef, something YAML cannot express, and there is a trap in doing it
-which L</CONNECTIONS> describes.
+which L<Dancer2::Session::Pg/CONNECTIONS> describes.
 
 =head1 DESCRIPTION
 
@@ -929,13 +958,15 @@ is digests, which open nothing.
 The id is also authenticated with the payload, so a sealed payload opens only
 under the session it was written for and cannot be moved from one row to
 another.
-L</SECURITY> says what that stops, where the key should live, and when to rotate
+L<Dancer2::Session::Pg/SECURITY> says what that stops, where the key should
+live, and when to rotate
 it.
 
 Which cipher is a property of the key it is used with, and both are
 B<replaceable>: every payload records the key and the cipher that sealed it, so
 a cipher found wanting next year is three deployments rather than a forced
-logout. See L</THE STORED PAYLOAD>, L</Rotating the key> and
+logout. See L<Dancer2::Session::Pg/THE STORED PAYLOAD>,
+L<Dancer2::Session::Pg/Rotating the key> and
 L<Dancer2::Session::Pg::Cipher>.
 
 =item Expiry decided by the server's clock
@@ -964,20 +995,23 @@ cap.
 That is a guarantee about database integrity, not about every write succeeding:
 concurrent writers to one row serialise on its lock, and a waiter that exceeds
 C<statement_timeout> is cancelled on purpose rather than holding a worker. See
-L</A blocked write fails rather than waiting>.
+L<Dancer2::Session::Pg/A blocked write fails rather than waiting>.
 
 It does B<not> mean two workers cannot lose each other's changes. The payload is
 one encrypted blob, so a write replaces all of it and the last writer wins. See
-L</CONCURRENCY>, which says exactly what is and is not promised, and is backed by
+L<Dancer2::Session::Pg/CONCURRENCY>, which says exactly what is and is not
+promised, and is backed by
 a test rather than by this paragraph.
 
 =back
 
 On top of that, an B<optional> clear column beside the encrypted payload makes it
 possible to find and end every session belonging to one account without
-decrypting anything -- see L</destroy_for_principal>. Suspending an account has
+decrypting anything -- see L<Dancer2::Session::Pg/destroy_for_principal>.
+Suspending an account has
 little effect while the suspended user's cookie still works. That column is off
-by default and need not exist; L</THE PRINCIPAL COLUMN> is about whether you want
+by default and need not exist; L<Dancer2::Session::Pg/THE PRINCIPAL COLUMN> is
+about whether you want
 it.
 
 =head2 Why this is PostgreSQL and not portable SQL
@@ -1015,7 +1049,8 @@ in the application, which has the same race and loses atomicity as well.
 
 =item C<statement_timeout>, so a blocked write fails instead of hanging
 
-L</A blocked write fails rather than waiting> is a guarantee about the worker,
+L<Dancer2::Session::Pg/A blocked write fails rather than waiting> is a
+guarantee about the worker,
 not the row, and it rests on a PostgreSQL setting applied per connection. The
 standard has no equivalent: there is no portable way to say "cancel this
 statement after 400ms". Without it a writer that lands behind an open
@@ -1052,10 +1087,18 @@ application remembered to.
 =head1 REQUIREMENTS
 
 PostgreSQL B<9.5> or later, for C<INSERT ... ON CONFLICT DO UPDATE> -- see
-L</Why this is PostgreSQL and not portable SQL> for why that statement and not
+L<Dancer2::Session::Pg/Why this is PostgreSQL and not portable SQL> for why
+that statement and not
 the standard C<MERGE>.
 
-For Perl, the floor in F<dist.ini> is the authority.
+Perl B<v5.14> or later. That number comes from L<Dancer2>, not from this
+module: Dancer2 2.x declares C<perl 5.014> in its metadata, so no version of
+this engine can install anywhere Dancer2 cannot. Nothing here uses syntax newer
+than v5.12, which is what C<Dancer2.pm> itself still says in its own C<use>
+line -- but the installable floor is the one its metadata sets, and that is
+v5.14.
+
+The prerequisites in F<dist.ini> are the authority if the two ever disagree.
 
 =head1 THE TABLE
 
@@ -1620,7 +1663,7 @@ indefinitely.
 
 =head1 CONNECTIONS
 
-Four ways to give this engine a database, in increasing order of how much Perl
+Five ways to give this engine a database, in increasing order of how much Perl
 you have to write. The first needs none and is the right answer unless you have
 a reason.
 
@@ -1784,6 +1827,34 @@ protocol state. Connect lazily, as above, so each worker opens its own.
 
 =head1 METHODS
 
+=head2 destroy_row
+
+    my $deleted = $engine->destroy_row($row_id);
+
+Deletes one row by the value its C<id> column holds -- a digest, as returned by
+L</sessions> or L</sessions_for_principal>. Returns the number of rows removed,
+so C<0> means there was nothing there.
+
+This exists because the C<id> column stores a digest rather than the session id
+(L</Why the session id is stored as a digest>), which makes the two deletes
+different operations:
+
+    $engine->destroy( id => $from_a_cookie );   # hashes its argument
+    $engine->destroy_row($from_sessions);       # does not
+
+Using the wrong one croaks rather than silently deleting nothing. That is the
+whole point of the pair: C<destroy> would hash a digest a second time and match
+no row, which a cleaning script would report as a successful deletion.
+
+So the iteration that L<Dancer2::Core::Role::SessionFactory> describes works:
+
+    for my $row_id ( @{ $engine->sessions } ) {
+        $engine->destroy_row($row_id);
+    }
+
+Although for the two cases that actually come up, one statement is better than a
+loop: L</reap> for everything expired, L</destroy_for_principal> for one account.
+
 =head2 destroy_for_principal
 
     my $removed = $engine->destroy_for_principal($principal);
@@ -1802,10 +1873,12 @@ Returns an arrayref of row identifiers for a principal's unexpired sessions.
 Croaks if C<principal_key> is not configured.
 
 B<Those are digests, not session ids>, for the reason in
-L</Why the session id is stored as a digest>. Count them, compare their number
-before and after a revocation, feed them to nothing. If you want to end the
-sessions rather than look at them, L</destroy_for_principal> does it in one
-statement and never puts them in a variable.
+L</Why the session id is stored as a digest>. A digest is what L</destroy_row>
+takes, so a list from here can be iterated and deleted; it is B<not> what
+C<destroy> takes, which expects the value out of a cookie.
+
+To end a principal's sessions rather than look at them, L</destroy_for_principal>
+does it in one statement and never puts them in a variable.
 
 =head2 count_sessions
 

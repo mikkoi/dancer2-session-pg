@@ -173,6 +173,34 @@ T2->subtest_streamed(
     }
 );
 
+# THE ROLE'S OWN USE FOR sessions(): a cleaning script. It only works because
+# destroy_row takes what the id column holds, which destroy() does not.
+T2->subtest_streamed(
+    'sessions() can be iterated and deleted, which is what the role documents' => sub {
+        $engine->_flush( "iter-$_", { principal => 'PRL-I', n => $_ } ) for 1 .. 3;
+
+        my $rows = $engine->sessions;
+        T2->ok( ref $rows eq 'ARRAY',                             '_sessions returns an arrayref, as the role requires' );
+        T2->ok( ( scalar grep { $_ eq rid('iter-1') } @{$rows} ), 'and the rows are there, by digest' );
+
+        # The trap: the value from sessions() is NOT what destroy() takes.
+        my $before = $engine->count_sessions->{'live'};
+        T2->like(
+            dies { $engine->destroy_row('iter-1') },
+            qr/64[ ]hex[ ]characters/msx,
+            'passing a SESSION id to destroy_row croaks instead of deleting nothing'
+        );
+        T2->is( $engine->count_sessions->{'live'}, $before, 'and nothing was deleted' );
+
+        # The documented loop.
+        my $deleted = 0;
+        $deleted += $engine->destroy_row($_) for map { rid("iter-$_") } 1 .. 3;
+        T2->is( $deleted,                              3,     'destroy_row removes one row per call and says so' );
+        T2->is( scalar $engine->_retrieve('iter-2'),   undef, 'the sessions are gone' );
+        T2->is( $engine->destroy_row( rid('iter-1') ), 0,     'deleting an absent row reports 0, not 1' );
+    }
+);
+
 # WHAT A DATABASE DUMP IS WORTH, which is the other half of "encrypted at rest".
 # The session id IS the cookie, so storing it verbatim would put a working
 # credential for every unexpired session in every backup -- no key required.

@@ -195,6 +195,28 @@ C<seal> and C<unseal> are handed the key for that slot and never asked to choose
 
 An integer in C<1 .. 255>, written into every payload. Permanent; see above.
 
+B<Four are already taken>, and they are part of the stored format, so they are
+not available for reuse:
+
+    1    AES-128-GCM            (Dancer2::Session::Pg::Cipher::AESGCM, 16-byte key)
+    2    AES-192-GCM            (the same class, 24-byte key)
+    3    AES-256-GCM            (the same class, 32-byte key)
+    4    ChaCha20-Poly1305      (Dancer2::Session::Pg::Cipher::ChaCha20Poly1305)
+
+B<Pick from C<128 .. 255> for a cipher of your own.> The low numbers are left
+for further built-ins, and the engine refuses a ring in which two different
+classes claim one id -- so a collision is caught at construction rather than at
+somebody's next login, but only when both are configured at once. A class that
+claims a taken id while the built-in is absent will read its own writes happily
+and then fail to open anything written before it, with the header agreeing and
+the tag not.
+
+Claiming one of the four ON PURPOSE is a legitimate thing to do, and means
+exactly one thing: B<this class is a byte-compatible drop-in> for that cipher,
+able to read every row the original wrote -- a different implementation of the
+same algorithm, not a different algorithm. If it cannot read those rows, it
+needs its own id.
+
 =head2 cipher_name
 
 A short string for error messages and C<algorithms>. Not stored.

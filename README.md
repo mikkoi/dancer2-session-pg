@@ -50,9 +50,10 @@ PostgreSQL session backend for Dancer2
     );
 
 Most applications configure this from `config.yml` rather than in Perl -- see
-["A configuration file"](#a-configuration-file). Installing the engine by hand is for when `dbh` has to
+["A configuration file" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#A-configuration-file). Installing the engine by hand is
+for when `dbh` has to
 be a coderef, something YAML cannot express, and there is a trap in doing it
-which ["CONNECTIONS"](#connections) describes.
+which ["CONNECTIONS" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#CONNECTIONS) describes.
 
 # DESCRIPTION
 
@@ -81,13 +82,15 @@ convention:
     The id is also authenticated with the payload, so a sealed payload opens only
     under the session it was written for and cannot be moved from one row to
     another.
-    ["SECURITY"](#security) says what that stops, where the key should live, and when to rotate
+    ["SECURITY" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#SECURITY) says what that stops, where the key should
+    live, and when to rotate
     it.
 
     Which cipher is a property of the key it is used with, and both are
     **replaceable**: every payload records the key and the cipher that sealed it, so
     a cipher found wanting next year is three deployments rather than a forced
-    logout. See ["THE STORED PAYLOAD"](#the-stored-payload), ["Rotating the key"](#rotating-the-key) and
+    logout. See ["THE STORED PAYLOAD" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#THE-STORED-PAYLOAD),
+    ["Rotating the key" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#Rotating-the-key) and
     [Dancer2::Session::Pg::Cipher](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg%3A%3ACipher).
 
 - Expiry decided by the server's clock
@@ -116,18 +119,21 @@ convention:
     That is a guarantee about database integrity, not about every write succeeding:
     concurrent writers to one row serialise on its lock, and a waiter that exceeds
     `statement_timeout` is cancelled on purpose rather than holding a worker. See
-    ["A blocked write fails rather than waiting"](#a-blocked-write-fails-rather-than-waiting).
+    ["A blocked write fails rather than waiting" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#A-blocked-write-fails-rather-than-waiting).
 
     It does **not** mean two workers cannot lose each other's changes. The payload is
     one encrypted blob, so a write replaces all of it and the last writer wins. See
-    ["CONCURRENCY"](#concurrency), which says exactly what is and is not promised, and is backed by
+    ["CONCURRENCY" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#CONCURRENCY), which says exactly what is and is not
+    promised, and is backed by
     a test rather than by this paragraph.
 
 On top of that, an **optional** clear column beside the encrypted payload makes it
 possible to find and end every session belonging to one account without
-decrypting anything -- see ["destroy\_for\_principal"](#destroy_for_principal). Suspending an account has
+decrypting anything -- see ["destroy\_for\_principal" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#destroy_for_principal).
+Suspending an account has
 little effect while the suspended user's cookie still works. That column is off
-by default and need not exist; ["THE PRINCIPAL COLUMN"](#the-principal-column) is about whether you want
+by default and need not exist; ["THE PRINCIPAL COLUMN" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#THE-PRINCIPAL-COLUMN) is
+about whether you want
 it.
 
 ## Why this is PostgreSQL and not portable SQL
@@ -163,7 +169,8 @@ have or does not define strongly enough to rely on.
 
 - `statement_timeout`, so a blocked write fails instead of hanging
 
-    ["A blocked write fails rather than waiting"](#a-blocked-write-fails-rather-than-waiting) is a guarantee about the worker,
+    ["A blocked write fails rather than waiting" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#A-blocked-write-fails-rather-than-waiting) is a
+    guarantee about the worker,
     not the row, and it rests on a PostgreSQL setting applied per connection. The
     standard has no equivalent: there is no portable way to say "cancel this
     statement after 400ms". Without it a writer that lands behind an open
@@ -198,10 +205,18 @@ application remembered to.
 # REQUIREMENTS
 
 PostgreSQL **9.5** or later, for `INSERT ... ON CONFLICT DO UPDATE` -- see
-["Why this is PostgreSQL and not portable SQL"](#why-this-is-postgresql-and-not-portable-sql) for why that statement and not
+["Why this is PostgreSQL and not portable SQL" in Dancer2::Session::Pg](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg#Why-this-is-PostgreSQL-and-not-portable-SQL) for why
+that statement and not
 the standard `MERGE`.
 
-For Perl, the floor in `dist.ini` is the authority.
+Perl **v5.14** or later. That number comes from [Dancer2](https://metacpan.org/pod/Dancer2), not from this
+module: Dancer2 2.x declares `perl 5.014` in its metadata, so no version of
+this engine can install anywhere Dancer2 cannot. Nothing here uses syntax newer
+than v5.12, which is what `Dancer2.pm` itself still says in its own `use`
+line -- but the installable floor is the one its metadata sets, and that is
+v5.14.
+
+The prerequisites in `dist.ini` are the authority if the two ever disagree.
 
 
 ## 💻 Contributors
