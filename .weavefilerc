@@ -72,10 +72,15 @@ files:
         [% dist.abstract %]
 
 
-        [% dist.version %]
+        [% pod("Dancer2::Session::Pg", "VERSION") %]
 
+        [% pod("Dancer2::Session::Pg", "STATUS") %]
 
         [% pod("Dancer2::Session::Pg", "SYNOPSIS") %]
+
+        [% pod("Dancer2::Session::Pg", "DESCRIPTION") %]
+
+        [% pod("Dancer2::Session::Pg", "REQUIREMENTS") %]
 
 
         [% snippets.contributors %]
