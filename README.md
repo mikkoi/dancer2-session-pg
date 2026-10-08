@@ -18,8 +18,14 @@
 PostgreSQL session backend for Dancer2
 
 
-0.001
+# VERSION
 
+version 0.001
+
+# STATUS
+
+Package Dancer2::Session::Pg is under development so changes in the API
+are possible, though not likely.
 
 # SYNOPSIS
 

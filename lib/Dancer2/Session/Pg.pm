@@ -895,6 +895,11 @@ Dancer2::Session::Pg - PostgreSQL session backend for Dancer2
 
 version 0.001
 
+=head1 STATUS
+
+Package Dancer2::Session::Pg is under development so changes in the API
+are possible, though not likely.
+
 =head1 SYNOPSIS
 
     use Dancer2::Session::Pg ();
