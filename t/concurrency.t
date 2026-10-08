@@ -36,10 +36,16 @@ use POSIX      ();
 
 use FindBin qw( $Bin );    ## no critic (Community::DiscouragedModules) -- how a test finds t/lib; the warning is for applications
 use lib "$Bin/lib";
-use SessionPgTest::PgDB  ();
-use SessionPgTest::Ddl   ();
-use Dancer2::Session::Pg ();
-use DBI                  ();
+use SessionPgTest::PgDB   ();
+use SessionPgTest::Ddl    ();
+use Dancer2::Session::Pg  ();
+use Crypt::Digest::SHA256 qw( sha256_hex );
+
+# The id column holds SHA-256 of the session id, so a test reaching into the
+# table by id has to hash it the same way the engine does.
+sub rid { my ($id) = @_; return sha256_hex($id) }
+
+use DBI ();
 
 T2->skip_all('this platform cannot fork, so real concurrency cannot be tested')
   if !$Config{'d_fork'};
@@ -138,7 +144,7 @@ T2->subtest_streamed(
         T2->is( $errors, q{}, 'and nothing was recorded -- no deadlock, no unique violation' )
           or T2->diag($errors);
 
-        my ($rows) = $dbh->selectrow_array("SELECT count(*) FROM $SCHEMA.sessions WHERE id = 'hot'");
+        my ($rows) = $dbh->selectrow_array( "SELECT count(*) FROM $SCHEMA.sessions WHERE id = ?", undef, rid('hot') );
         T2->is( $rows, 1, 'ON CONFLICT left exactly one row, not one per worker' );
 
         # THE INVARIANT THAT MATTERS FOR SECURITY. `expires` and `created` are both
@@ -147,7 +153,7 @@ T2->subtest_streamed(
         # after N*M concurrent writes is the proof that no race moves the cap.
         my ($cap_intact) = $dbh->selectrow_array(
             "SELECT expires = created + interval '$CAP seconds'
-           FROM $SCHEMA.sessions WHERE id = 'hot'"
+           FROM $SCHEMA.sessions WHERE id = ?", undef, rid('hot')
         );
         T2->ok( $cap_intact, 'and the expiry cap is still the one the FIRST write set' );
 
@@ -173,7 +179,10 @@ T2->subtest_streamed(
 
         T2->is( reap_children(@pids), 0, 'every worker wrote its own session' );
 
-        my ($rows) = $dbh->selectrow_array("SELECT count(*) FROM $SCHEMA.sessions WHERE id LIKE 'own-%'");
+        # No prefix match: the column holds digests, which share no prefix with
+        # each other or with the session ids. Ask for the exact set instead.
+        my $wanted = join q{,}, map { $dbh->quote( rid("own-$_") ) } 1 .. $WORKERS;
+        my ($rows) = $dbh->selectrow_array("SELECT count(*) FROM $SCHEMA.sessions WHERE id IN ($wanted)");
         T2->is( $rows, $WORKERS, "all $WORKERS rows are present" );
 
         my $engine = engine();
@@ -193,9 +202,14 @@ T2->subtest_streamed(
         close $fh or croak "cannot close the temporary file: $OS_ERROR";
 
         my $holder = DBI->connect( $DSN, $DBUSER, undef, { RaiseError => 1, PrintError => 0, AutoCommit => 0 } );
+
+        # The DIGEST, not the session id: the engine writes digests, so an
+        # insert of the raw id would take a different row and there would be
+        # nothing to block on.
         $holder->do(
             "INSERT INTO $SCHEMA.sessions (id, session_data, expires)
-                  VALUES ('blocked', '\\x00', now() + interval '$CAP seconds')"
+                  VALUES (?, '\\x00', now() + interval '$CAP seconds')",
+            undef, rid('blocked')
         );
 
         # Still uncommitted, so the row is invisible but its id is taken: a second
@@ -248,7 +262,7 @@ T2->subtest_streamed(
         T2->is( $final->{'step'}, 'address', 'the second writer change is there' );
         T2->is( $final->{'cart'}, ['apple'], 'and the FIRST writer change is GONE -- the whole payload was replaced' );
 
-        my ($rows) = $dbh->selectrow_array("SELECT count(*) FROM $SCHEMA.sessions WHERE id = 'rmw'");
+        my ($rows) = $dbh->selectrow_array( "SELECT count(*) FROM $SCHEMA.sessions WHERE id = ?", undef, rid('rmw') );
         T2->is( $rows, 1, 'no duplicate row came of it, which is the part ON CONFLICT does promise' );
     }
 );

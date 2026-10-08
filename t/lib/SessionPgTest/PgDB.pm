@@ -41,10 +41,46 @@ sub provision {
     } else {
         push @CLEANUP, sub {
             eval { $dbh->disconnect if $dbh };
-            system 'dropdb', '--if-exists', $name;
+
+            # Disconnecting OUR handle is not enough. Anything else holding a
+            # connection to this database -- an engine built with a dsn, which
+            # opens its own -- keeps dropdb from working, and dropdb then exits
+            # non-zero and leaves the database behind. A file-scoped `my $engine`
+            # happens to be released before END runs, which is the only reason
+            # this has not been leaking; a package variable would not be.
+            #
+            # So evict the other backends first, from a connection to another
+            # database, and then say so if dropdb still fails.
+            _terminate_backends($name);
+
+            if ( system( 'dropdb', '--if-exists', $name ) != 0 ) {
+                warn "SessionPgTest::PgDB: could not drop database '$name'; " . "drop it by hand with: dropdb $name\n";
+            }
         };
     }
     return ( $dbh, $name );
+}
+
+# Ask PostgreSQL to close every other connection to this throwaway database.
+# Connects to `postgres`, because a backend cannot terminate the database it is
+# itself attached to. Best effort: if this fails there is nothing useful to do
+# about it, and the dropdb that follows will report the real problem.
+sub _terminate_backends {
+    my ($name) = @_;
+
+    my $admin = eval { DBI->connect( 'dbi:Pg:dbname=postgres', q{}, q{}, { AutoCommit => 1, RaiseError => 1, PrintError => 0 } ); };
+    return if !$admin;
+
+    eval {
+        $admin->do(
+            'SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+              WHERE datname = ? AND pid <> pg_backend_pid()', undef, $name
+        );
+        1;
+    };
+    eval { $admin->disconnect };
+
+    return;
 }
 
 1;

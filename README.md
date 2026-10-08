@@ -23,33 +23,36 @@ PostgreSQL session backend for Dancer2
 
 # SYNOPSIS
 
-    # config.yml -- the whole of it, for an application with no principal concept
-    session: 'Pg'
-    engines:
-      session:
-        Pg:
-          dsn:     "dbi:Pg:dbname=app;host=db"
-          dbuser:  "app_web"
-          dbpass:  "..."
-          dbtable: "sessions"     # required
-          dbschema: "web"         # optional; omit to use search_path
-          session_duration: 900
+    use Dancer2::Session::Pg ();
 
-          # One or more SLOTS, each pairing a key with the cipher that uses it.
-          # Exactly one is active: that is the one sessions are written with,
-          # and the rest stay to be read. See SECURITY for where the key comes
-          # from -- it should not be a literal here.
-          encryption_keys:
-            0:
-              key:    "${ENV:SESSION_KEY_0}"
-              alg:    "AES-256-GCM"
-              active: true
+    my $engine = Dancer2::Session::Pg->new(
+        dsn              => 'dbi:Pg:dbname=app;host=db',
+        dbuser           => 'app_web',
+        dbpass           => $ENV{'APP_DB_PASSWORD'},
+        dbtable          => 'sessions',          # required
+        dbschema         => 'web',               # optional; else search_path
+        session_duration => 900,
 
-    # and, if you want the optional principal column (see THE PRINCIPAL COLUMN)
-          principal_key:    "principal"    # which session key to copy
-          principal_column: "account_id"   # optional; default principal_id
+        # One or more SLOTS, each pairing a key with the cipher that uses it.
+        # Exactly one is active: that is the one sessions are written with, and
+        # the rest stay to be read. See SECURITY for where the key comes from.
+        encryption_keys => {
+            0 => {
+                key    => $ENV{'SESSION_KEY_0'},
+                alg    => 'AES-256-GCM',
+                active => 1,
+            },
+        },
 
-          json_module:      "JSON::MaybeXS"
+        # Optional; see THE PRINCIPAL COLUMN for whether you want it at all.
+        principal_key    => 'principal',
+        principal_column => 'account_id',
+    );
+
+Most applications configure this from `config.yml` rather than in Perl -- see
+["A configuration file"](#a-configuration-file). Installing the engine by hand is for when `dbh` has to
+be a coderef, something YAML cannot express, and there is a trap in doing it
+which ["CONNECTIONS"](#connections) describes.
 
 
 ## 💻 Contributors

@@ -663,6 +663,49 @@ T2->subtest_streamed(
                     );
                 },
             ],
+
+            # A digits-only check would accept '00', pack it into the header as
+            # the byte 0, then look it up on read as the integer 0 -- missing a
+            # ring keyed by the string. Writes succeed and every read fails.
+            [
+                q{a non-canonical slot id, '00'},
+                qr/canonical[ ]integer/msx,
+                sub { engine( encryption_keys => { '00' => slot( $KEY32, undef, 1 ) } ) },
+            ],
+            [
+                q{a non-canonical slot id, '007'},
+                qr/canonical[ ]integer/msx,
+                sub { engine( encryption_keys => { '007' => slot( $KEY32, undef, 1 ) } ) },
+            ],
+
+            # Several slots MAY share a cipher -- that is an ordinary key
+            # rotation. Two different classes claiming one id may not: the
+            # header's cipher byte is what diagnoses a slot whose alg was
+            # edited in place, and it could not tell them apart.
+            [
+                'two cipher classes claiming one cipher id',
+                qr/claimed[ ]by[ ]both/msx,
+                sub {
+                    engine(
+                        encryption_keys => {
+                            0 => slot( $KEY32, 'ChaCha20-Poly1305', 1 ),
+                            1 => slot( $KEY32, 'Test::Cipher::ClashesWithChaCha' ),
+                        }
+                    );
+                },
+            ],
+            [
+                'a supplied handle that will not raise errors',
+                qr/RaiseError[ ]off/msx,
+                sub {
+                    my $engine = Dancer2::Session::Pg->new(
+                        dbh             => bless( { RaiseError => 0 }, 'Test::Handle::NotRaising' ),
+                        dbtable         => 'sessions',
+                        encryption_keys => { 0 => slot( $KEY32, undef, 1 ) },
+                    );
+                    $engine->_dbh;
+                },
+            ],
             [
                 'a slot id outside the one byte the header has',
                 qr/0[.][.]255/msx,

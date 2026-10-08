@@ -20,11 +20,17 @@ use Test2::V1 qw( -utf8 -x ), -include => [ [ 'Test2::Tools::Subtest', 'subtest_
 
 use FindBin qw( $Bin );    ## no critic (Community::DiscouragedModules) -- how a test finds t/lib; the warning is for applications
 use lib "$Bin/lib";
-use SessionPgTest::PgDB  ();
-use SessionPgTest::Ddl   ();
-use Dancer2::Session::Pg ();
-use DBI                  ();
-use DBD::Pg              qw( :pg_types );
+use SessionPgTest::PgDB   ();
+use SessionPgTest::Ddl    ();
+use Dancer2::Session::Pg  ();
+use Crypt::Digest::SHA256 qw( sha256_hex );
+
+# The id column holds SHA-256 of the session id, so a test reaching into the
+# table by id has to hash it the same way the engine does.
+sub rid { my ($id) = @_; return sha256_hex($id) }
+
+use DBI     ();
+use DBD::Pg qw( :pg_types );
 
 my $WITH    = 'sesswith';       # table that has the optional principal column
 my $WITHOUT = 'sesswithout';    # table that does not
@@ -84,7 +90,7 @@ my $engine = engine();
 my $raw = sub {
     my ( $id, $schema ) = @_;
     $schema ||= $WITH;
-    my $row = $dbh->selectrow_arrayref( "SELECT session_data FROM $schema.sessions WHERE id = ?", undef, $id );
+    my $row = $dbh->selectrow_arrayref( "SELECT session_data FROM $schema.sessions WHERE id = ?", undef, rid($id) );
     return $row ? $row->[0] : undef;
 };
 
@@ -95,11 +101,11 @@ T2->subtest_streamed(
         T2->is( $engine->_retrieve('sess-1'), $data, 'a session round trips intact' );
         T2->ok( index( $raw->('sess-1'), 'SECRET-TOKEN-VALUE' ) < 0, 'the token does NOT appear in the stored bytes' );
 
-        my ($clear) = $dbh->selectrow_array( "SELECT principal_id FROM $WITH.sessions WHERE id = ?", undef, 'sess-1' );
+        my ($clear) = $dbh->selectrow_array( "SELECT principal_id FROM $WITH.sessions WHERE id = ?", undef, rid('sess-1') );
         T2->is( $clear, 'PRL-123', 'the principal id IS in its clear column' );
 
         $engine->_flush( 'sess-1', { %{$data}, n => 43 } );
-        my ($count) = $dbh->selectrow_array("SELECT count(*) FROM $WITH.sessions WHERE id = 'sess-1'");
+        my ($count) = $dbh->selectrow_array( "SELECT count(*) FROM $WITH.sessions WHERE id = ?", undef, rid('sess-1') );
         T2->is( $count,                              1,  'ON CONFLICT updates in place' );
         T2->is( $engine->_retrieve('sess-1')->{'n'}, 43, 'the update took' );
     }
@@ -113,10 +119,10 @@ T2->subtest_streamed(
 T2->subtest_streamed(
     'session_duration is an absolute cap, not an idle timeout' => sub {
         $engine->_flush( 'cap-1', { v => 1 } );
-        my ($first) = $dbh->selectrow_array("SELECT expires FROM $WITH.sessions WHERE id = 'cap-1'");
+        my ($first) = $dbh->selectrow_array( "SELECT expires FROM $WITH.sessions WHERE id = ?", undef, rid('cap-1') );
         $dbh->do('SELECT pg_sleep(1)');
         $engine->_flush( 'cap-1', { v => 2 } );
-        my ($later) = $dbh->selectrow_array("SELECT expires FROM $WITH.sessions WHERE id = 'cap-1'");
+        my ($later) = $dbh->selectrow_array( "SELECT expires FROM $WITH.sessions WHERE id = ?", undef, rid('cap-1') );
 
         T2->is( $later, $first,                        'a later write does NOT push expiry out -- the cap runs from creation' );
         T2->is( $engine->_retrieve('cap-1')->{'v'}, 2, 'while the data is still updated' );
@@ -125,7 +131,7 @@ T2->subtest_streamed(
 
 T2->subtest_streamed(
     'expiry is the server clock decision' => sub {
-        $dbh->do("UPDATE $WITH.sessions SET expires = now() - interval '1 second' WHERE id = 'sess-1'");
+        $dbh->do( "UPDATE $WITH.sessions SET expires = now() - interval '1 second' WHERE id = ?", undef, rid('sess-1') );
         T2->is( scalar $engine->_retrieve('sess-1'), undef, 'an expired session is not returned' );
         T2->is( $engine->reap,                       1,     'reap removes exactly the expired row' );
     }
@@ -150,7 +156,7 @@ T2->subtest_streamed(
             'and the row moved WITH ITS CONTENTS -- re-sealed under the new id'
         );
 
-        my ($rows) = $dbh->selectrow_array("SELECT count(*) FROM $WITH.sessions WHERE id = 'keep-2'");
+        my ($rows) = $dbh->selectrow_array( "SELECT count(*) FROM $WITH.sessions WHERE id = ?", undef, rid('keep-2') );
         T2->is( $rows, 1, 'as one row, not a copy' );
 
         $engine->_destroy('keep-2');
@@ -159,10 +165,35 @@ T2->subtest_streamed(
         # A row that cannot be read has nothing to carry across, so _change_id
         # removes it rather than leaving a payload nobody can open under a fresh id.
         $engine->_flush( 'unreadable-1', { v => 1 } );
-        $dbh->do("UPDATE $WITH.sessions SET session_data = '\\x00' WHERE id = 'unreadable-1'");
+        $dbh->do( "UPDATE $WITH.sessions SET session_data = '\\x00' WHERE id = ?", undef, rid('unreadable-1') );
         $engine->_change_id( 'unreadable-1', 'unreadable-2' );
-        my ($remaining) = $dbh->selectrow_array("SELECT count(*) FROM $WITH.sessions WHERE id IN ('unreadable-1','unreadable-2')");
+        my ($remaining) = $dbh->selectrow_array( "SELECT count(*) FROM $WITH.sessions WHERE id IN (?,?)",
+            undef, rid('unreadable-1'), rid('unreadable-2') );
         T2->is( $remaining, 0, 'an unreadable row is deleted by _change_id, not renamed' );
+    }
+);
+
+# WHAT A DATABASE DUMP IS WORTH, which is the other half of "encrypted at rest".
+# The session id IS the cookie, so storing it verbatim would put a working
+# credential for every unexpired session in every backup -- no key required.
+T2->subtest_streamed(
+    'a dump yields no replayable session id' => sub {
+        $engine->_flush( 'dump-victim', { principal => 'PRL-D', admin => 1 } );
+
+        # Everything an attacker gets from `pg_dump` of this table.
+        my $dumped = $dbh->selectall_arrayref("SELECT id FROM $WITH.sessions");
+        my @ids    = map { $_->[0] } @{$dumped};
+
+        T2->ok( scalar @ids, 'the dump has rows' );
+        T2->is( scalar( grep { $_ eq 'dump-victim' } @ids ),      0, 'and NONE of them is the session id itself' );
+        T2->is( scalar( grep { $_ eq rid('dump-victim') } @ids ), 1, 'the row is found by digest instead' );
+        ## no critic (RegularExpressions::ProhibitEnumeratedClasses) -- hex is ASCII; [[:xdigit:]] is Unicode-aware and allows A-F, which sha256_hex never emits
+        T2->like( $ids[0], qr/\A[0-9a-f]{64}\z/msx, 'every stored id is a SHA-256 digest' );
+
+        # The crucial part: presenting what the dump contains does not work.
+        # Dancer2 would hand `id` straight to _retrieve as the cookie value.
+        T2->is( scalar $engine->_retrieve( rid('dump-victim') ), undef, 'replaying the stored value as a cookie opens nothing' );
+        T2->is( $engine->_retrieve('dump-victim')->{'admin'},    1,     'while the real cookie still works' );
     }
 );
 
@@ -175,11 +206,13 @@ T2->subtest_streamed(
         $engine->_flush( 'victim-admin',  { principal => 'PRL-ADMIN', admin => 1 } );
         $engine->_flush( 'victim-attack', { principal => 'PRL-EVIL',  admin => 0 } );
 
-        my ($admin_blob) = $dbh->selectrow_array("SELECT session_data FROM $WITH.sessions WHERE id = 'victim-admin'");
+        my ($admin_blob) =
+          $dbh->selectrow_array( "SELECT session_data FROM $WITH.sessions WHERE id = ?", undef, rid('victim-admin') );
 
         # Write access to the table, and NO encryption key.
-        my $sth = $dbh->prepare("UPDATE $WITH.sessions SET session_data = ? WHERE id = 'victim-attack'");
+        my $sth = $dbh->prepare("UPDATE $WITH.sessions SET session_data = ? WHERE id = ?");
         $sth->bind_param( 1, $admin_blob, { pg_type => PG_BYTEA } );
+        $sth->bind_param( 2, rid('victim-attack') );
         $sth->execute;
 
         T2->is( scalar $engine->_retrieve('victim-attack'),
@@ -194,8 +227,9 @@ T2->subtest_streamed(
         my $blob    = $raw->('tamper');
         my $flipped = ( ord substr $blob, -1 ) ^ 0xFF;
         substr $blob, -1, 1, chr $flipped;
-        my $sth = $dbh->prepare("UPDATE $WITH.sessions SET session_data = ? WHERE id = 'tamper'");
+        my $sth = $dbh->prepare("UPDATE $WITH.sessions SET session_data = ? WHERE id = ?");
         $sth->bind_param( 1, $blob, { pg_type => PG_BYTEA } );
+        $sth->bind_param( 2, rid('tamper') );
         $sth->execute;
         T2->is( scalar $engine->_retrieve('tamper'), undef, 'an altered payload does not decrypt' );
 
@@ -321,7 +355,7 @@ T2->subtest_streamed(
             'with no dbschema the table is referenced bare and search_path resolves it'
         );
 
-        my ($n) = $own->selectrow_array("SELECT count(*) FROM $WITHOUT.sessions WHERE id = 'bare-1'");
+        my ($n) = $own->selectrow_array( "SELECT count(*) FROM $WITHOUT.sessions WHERE id = ?", undef, rid('bare-1') );
         T2->is( $n, 1, 'and the row landed in the schema search_path names' );
         $own->disconnect;
     }
@@ -345,7 +379,7 @@ T2->subtest_streamed(
         $counted->_flush( "cnt-$_",   { principal => 'PRL-C' } ) for 1 .. 2;
         $counted->_flush( 'cnt-anon', { cart      => [1] } );
         $counted->_flush( 'cnt-old',  { principal => 'PRL-C' } );
-        $dbh->do("UPDATE $WITH.sessions SET expires = now() - interval '1 s' WHERE id = 'cnt-old'");
+        $dbh->do( "UPDATE $WITH.sessions SET expires = now() - interval '1 s' WHERE id = ?", undef, rid('cnt-old') );
 
         my $with = $counted->count_sessions;
         T2->is( $with->{'signed_in'} - $before->{'signed_in'},
@@ -392,7 +426,7 @@ T2->subtest_streamed(
         $fk->_flush( "fk-$_",    { user => { id => 7, name => 'ignored' } } ) for 1 .. 2;
         $fk->_flush( 'fk-other', { user => { id => 8 } } );
 
-        my ($stored) = $dbh->selectrow_array("SELECT account_id FROM $FK.sessions WHERE id = 'fk-1'");
+        my ($stored) = $dbh->selectrow_array( "SELECT account_id FROM $FK.sessions WHERE id = ?", undef, rid('fk-1') );
         T2->is( $stored, 7, 'a coderef principal_key lands in the renamed column' );
 
         T2->is( scalar @{ $fk->sessions_for_principal(7) }, 2, 'and is queryable through the index' );

@@ -18,6 +18,7 @@ use Module::Runtime       qw( is_module_name use_module );
 use Types::Standard       qw( CodeRef HashRef Int Maybe Object Str );
 use Types::Common::String qw( NonEmptySimpleStr );
 use Scalar::Util          qw( blessed );
+use Crypt::Digest::SHA256 qw( sha256_hex );
 use Crypt::PRNG           ();
 
 # Core `use constant`, which is what Dancer2 itself uses.
@@ -283,11 +284,16 @@ sub _build__slots {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutin
       . '{ 0 => { key => ..., alg => ..., active => 1 } }'
       if !keys %{$configured};
 
-    my ( %slot, @active );
+    my ( %slot, @active, %class_for_id );
     for my $id ( sort keys %{$configured} ) {
-        croak sprintf 'Dancer2::Session::Pg: key id %s must be an integer in 0..255' . ' -- it is one byte of every stored payload',
-          "'$id'"
-          if $id !~ m/\A[0-9]+\z/msx || $id > 255;    ## no critic (RegularExpressions::ProhibitEnumeratedClasses) -- [0-9] is ASCII-only; \d and [[:digit:]] both match Unicode digits
+
+        # CANONICAL decimal, not merely digits. A slot id of '00' would pass a
+        # digits-only check, be packed into the header as the byte 0, and then be
+        # looked up on read as the integer 0 -- which misses a %slot keyed by the
+        # string '00'. Writes would succeed and every read would fail.
+        croak sprintf 'Dancer2::Session::Pg: key id %s must be a canonical integer in 0..255'
+          . ' -- it is one byte of every stored payload', "'$id'"
+          if $id !~ m/\A(?:0|[1-9][0-9]*)\z/msx || $id > 255;    ## no critic (RegularExpressions::ProhibitEnumeratedClasses) -- [0-9] is ASCII-only; \d and [[:digit:]] both match Unicode digits
 
         my $spec = $configured->{$id};
         croak "Dancer2::Session::Pg: encryption_keys entry $id must be a hash with 'key' and 'alg'"
@@ -295,6 +301,18 @@ sub _build__slots {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutin
 
         my $cipher = _resolve_cipher( $spec->{'alg'} );
         $cipher->cipher_self_check;
+
+        # One cipher id, one implementation. Several slots may share a cipher --
+        # that is an ordinary key rotation -- but two DIFFERENT classes claiming
+        # one id would defeat the header's cross-check, which is the only thing
+        # that diagnoses a slot whose alg was edited in place: both would agree
+        # on the id while disagreeing about everything else.
+        my $claimed = $cipher->cipher_id;
+        croak sprintf 'Dancer2::Session::Pg: cipher id %d is claimed by both %s and %s. '
+          . 'An id identifies one implementation, and the stored header cannot tell them apart.',
+          $claimed, ref $class_for_id{$claimed}, ref $cipher
+          if exists $class_for_id{$claimed} && ref $class_for_id{$claimed} ne ref $cipher;
+        $class_for_id{$claimed} = $cipher;
 
         $slot{$id} = { key => $self->_slot_key( $id, $spec->{'key'}, $cipher ), cipher => $cipher };
         push @active, $id if $spec->{'active'};
@@ -393,9 +411,29 @@ sub _dbh {
 
     # A handle we were given belongs to the caller: its attributes, its
     # transaction, its lifetime. We neither reconfigure nor reconnect it.
+    #
+    # RaiseError is the one exception, and it is a refusal rather than a warning
+    # because without it this module reports nonsense instead of failing. With
+    # DBI's default of RaiseError => 0, `do` and `execute` return undef on
+    # error: a lost session write looks like a successful one, and
+    # destroy_for_principal answers "0 sessions revoked" when the DELETE
+    # actually failed. Being told an account's sessions are gone when they are
+    # not is worse than any error this could raise.
+    #
+    # Checked on every access rather than memoised: a pool may hand out a
+    # different handle each time, and one attribute read is cheap beside the
+    # queries that follow.
     if ( $self->has_dbh ) {
         my $handle = $self->dbh;
-        return ref $handle eq 'CODE' ? $handle->() : $handle;
+        $handle = $handle->() if ref $handle eq 'CODE';
+
+        croak 'Dancer2::Session::Pg: the supplied dbh has RaiseError off. This module '
+          . 'checks no DBI return values of its own, so a failed write would be reported '
+          . 'as a success and a failed revocation as "0 sessions". Set RaiseError => 1 on '
+          . 'the handle you pass, or pass a dsn and let this module open its own.'
+          if !$handle->{'RaiseError'};
+
+        return $handle;
     }
 
     my $dbh = $self->_own_dbh;
@@ -514,6 +552,33 @@ sub _unreadable {
 # nothing in them says which session they were for. Binding the id makes that
 # copy fail to decrypt, which is the same answer the module gives to any other
 # alteration.
+# WHAT GOES IN THE `id` COLUMN IS A DIGEST, NOT THE COOKIE.
+#
+# The session id IS a bearer token: Dancer2 takes it straight off the cookie and
+# this module hands back whatever it unlocks. Storing it verbatim would mean a
+# database dump contained a working credential for every unexpired session --
+# readable without the encryption key and replayable against any reachable
+# instance of the application. Encrypting the payload while storing the id in
+# the clear protects what is inside the house and leaves the front door key
+# under the mat.
+#
+# So the column holds SHA-256 of the id. The cookie is unchanged, every lookup
+# hashes first, and a dump yields digests that cannot be replayed.
+#
+# UNKEYED, deliberately. A keyed digest would also stop an attacker confirming a
+# guessed id, but Dancer2's ids are long and random -- the same reason an API
+# token needs no salt. And a key here could never be rotated: rotating it would
+# orphan every live session, in a module whose entire design is that keys
+# rotate. One un-rotatable key hiding among the rotatable ones is a worse trap
+# than the attack it would prevent.
+#
+# The payload binding in _aad still uses the RAW id, so a sealed payload stays
+# tied to the session it was written for rather than to its digest.
+sub _row_id {
+    my ( $self, $id ) = @_;
+    return sha256_hex( defined $id ? $id : q{} );
+}
+
 sub _aad {
     my ( $self, $header, $id ) = @_;
     return $header . ( defined $id ? $id : q{} );
@@ -604,7 +669,7 @@ sub _retrieve {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutines) 
     # depend on which one the request reached.
     my $row =
       $self->_dbh->selectrow_arrayref( "SELECT session_data FROM $table WHERE id = ? AND (expires IS NULL OR expires > now())",
-        undef, $id, );
+        undef, $self->_row_id($id), );
 
     return if !$row;
     return $self->_decrypt( $id, $row->[0] );
@@ -620,7 +685,7 @@ sub _flush {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutines) -- 
     my ( @columns, @values, @bind );
     push @columns, 'id';
     push @values,  q{?};
-    push @bind,    [ $id, undef ];
+    push @bind,    [ $self->_row_id($id), undef ];
     if ( defined $self->principal_key ) {
 
         # Assigned to a scalar first, ON PURPOSE. _principal_of returns a bare
@@ -675,7 +740,7 @@ sub _destroy {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutines) -
     my ( $self, $id ) = @_;
     croak 'Dancer2::Session::Pg: no session id passed to _destroy' if !defined $id;
     my $table = $self->_table;
-    $self->_dbh->do( "DELETE FROM $table WHERE id = ?", undef, $id );
+    $self->_dbh->do( "DELETE FROM $table WHERE id = ?", undef, $self->_row_id($id) );
     return;
 }
 
@@ -687,7 +752,7 @@ sub _change_id {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutines)
     # session id, so moving the row to a new id means RE-SEALING it -- which is
     # the price of making a payload unportable between rows, and it is charged
     # on login, where one extra round trip is affordable.
-    my $row  = $self->_dbh->selectrow_arrayref( "SELECT session_data FROM $table WHERE id = ?", undef, $old_id );
+    my $row  = $self->_dbh->selectrow_arrayref( "SELECT session_data FROM $table WHERE id = ?", undef, $self->_row_id($old_id) );
     my $data = $row ? $self->_decrypt( $old_id, $row->[0] ) : undef;
 
     if ( !defined $data ) {
@@ -695,14 +760,14 @@ sub _change_id {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutines)
         # Nothing readable to carry across. Delete rather than rename: a payload
         # nobody can open is worth less under a new id than it is gone, and the
         # caller still holds the session, so the next flush writes it afresh.
-        $self->_dbh->do( "DELETE FROM $table WHERE id = ?", undef, $old_id );
+        $self->_dbh->do( "DELETE FROM $table WHERE id = ?", undef, $self->_row_id($old_id) );
         return;
     }
 
     my $sth = $self->_dbh->prepare("UPDATE $table SET id = ?, session_data = ?, updated = now() WHERE id = ?");
-    $sth->bind_param( 1, $new_id );
+    $sth->bind_param( 1, $self->_row_id($new_id) );
     $sth->bind_param( 2, $self->_encrypt( $new_id, $data ), { pg_type => PG_BYTEA } );
-    $sth->bind_param( 3, $old_id );
+    $sth->bind_param( 3, $self->_row_id($old_id) );
     $sth->execute;
     return;
 }
@@ -792,7 +857,7 @@ __END__
 
 =encoding utf8
 
-=for stopwords AEAD AES ChaCha DDL DSN GCM Kubernetes NIST OpenID Poly XHR crashloops dbh dbpass dbschema dbtable dbuser decrypt decryptable decrypted decrypts deserialise deserialising diagnosable dsn encryptions nonces plaintext preforked rollout serialiser tablespace Koivunalho Mikko
+=for stopwords AEAD AES ChaCha DDL DSN GCM Kubernetes NIST OpenID Poly XHR unkeyed crashloops dbh dbpass dbschema dbtable dbuser decrypt decryptable decrypted decrypts deserialise deserialising diagnosable dsn encryptions nonces plaintext preforked rollout serialiser tablespace Koivunalho Mikko
 
 =head1 NAME
 
@@ -851,12 +916,19 @@ convention:
 =item Authenticated encryption at rest
 
 The payload is encrypted with an AEAD cipher, so a dump, a backup or a support
-copy of the table does not hand over working credentials, and a row that has
-been altered fails to decrypt instead of deserialising into a structure the
+copy of the table does not hand over the contents of a session, and a row that
+has been altered fails to decrypt instead of deserialising into a structure the
 application would then trust.
 
-The session id is authenticated along with it, so a sealed payload opens only
-under the id it was written for and cannot be moved from one row to another.
+Nor does it hand over a way in. B<The session id is stored as a SHA-256 digest,
+not verbatim>, because the id is the session cookie: a table full of raw ids
+would be a table full of working credentials, usable against the live
+application by anyone who read a backup, no key required. What a dump contains
+is digests, which open nothing.
+
+The id is also authenticated with the payload, so a sealed payload opens only
+under the session it was written for and cannot be moved from one row to
+another.
 L</SECURITY> says what that stops, where the key should live, and when to rotate
 it.
 
@@ -945,7 +1017,7 @@ identifier in the session is not a key of any table in this database (a
 federated C<sub> claim, a tenant-scoped id, an opaque token):
 
     CREATE TABLE web.sessions (
-        id           text        PRIMARY KEY,
+        id           text        PRIMARY KEY,   -- SHA-256 hex of the session id
         principal_id text,
         session_data bytea       NOT NULL,
         created      timestamptz NOT NULL DEFAULT now(),
@@ -957,7 +1029,7 @@ federated C<sub> claim, a tenant-scoped id, an opaque token):
         'Dancer2 session store (Dancer2::Session::Pg). Rows hold authenticated-encrypted session payloads; treat as credential material.';
 
     COMMENT ON COLUMN web.sessions.id IS
-        'Dancer2 session id, from the session cookie. Arbiter for ON CONFLICT.';
+        'SHA-256 of the Dancer2 session id -- NOT the id itself, which is the session cookie and would be replayable from a dump. Arbiter for ON CONFLICT.';
     COMMENT ON COLUMN web.sessions.principal_id IS
         'OPTIONAL -- drop this column if principal_key is not configured. Clear copy of the value named by principal_key, so sessions can be found and revoked without decrypting. May be free text as here, or a foreign key; see "THE PRINCIPAL COLUMN" in the module docs. NULL when the session has no such value.';
     COMMENT ON COLUMN web.sessions.session_data IS
@@ -985,7 +1057,7 @@ B<The smallest table this module can use.> Leave C<principal_key> unset and the
 column is never written, never read and need not exist:
 
     CREATE TABLE web.sessions (
-        id           text        PRIMARY KEY,
+        id           text        PRIMARY KEY,   -- SHA-256 hex of the session id
         session_data bytea       NOT NULL,
         created      timestamptz NOT NULL DEFAULT now(),
         updated      timestamptz NOT NULL DEFAULT now(),
@@ -1010,7 +1082,7 @@ keep it honest:
     );
 
     CREATE TABLE web.sessions (
-        id           text        PRIMARY KEY,
+        id           text        PRIMARY KEY,   -- SHA-256 hex of the session id
         account_id   bigint      REFERENCES web.accounts(id) ON DELETE CASCADE,
         session_data bytea       NOT NULL,
         created      timestamptz NOT NULL DEFAULT now(),
@@ -1296,8 +1368,19 @@ fails silently.
 
 =head3 SHARING A HANDLE
 
-A handle you supply belongs to you. This module does not set C<RaiseError>, does
-not apply C<statement_timeout>, does not reconnect it, and B<does not commit it>.
+A handle you supply belongs to you. This module does not apply
+C<statement_timeout>, does not reconnect it, and B<does not commit it>.
+
+B<One requirement, and it is a refusal rather than a warning: C<RaiseError>
+must be on.> This module checks no C<DBI> return value of its own, because a
+handle that raises is the only arrangement in which it can report the truth. With
+DBI's default of C<RaiseError =E<gt> 0>, C<execute> and C<do> answer C<undef> on
+failure and carry on: a session write that never happened looks like one that
+did, and L</destroy_for_principal> reports C<0> sessions revoked when the
+C<DELETE> actually failed. Being told that an account's sessions are gone when
+they are still live is a worse outcome than any exception. So the engine croaks
+rather than proceed. Set C<RaiseError =E<gt> 1> on the handle you pass, or pass a
+C<dsn> and let the module open its own.
 
 That last one deserves a straight answer, because it is the obvious question. If
 your handle has C<AutoCommit> off, a session write joins whatever transaction is
@@ -1583,10 +1666,12 @@ with the connection itself still in F<config.yml>, where it belongs:
             password: "..."
             dbi_params:
               AutoCommit: 1
+              RaiseError: 1
 
-Note C<AutoCommit: 1>. L<Dancer2::Plugin::Database> defaults to it, but say so
-anyway: with it off, this module will not commit the handle and your sessions
-wait for a commit that never comes. See L</SHARING A HANDLE>.
+Set both C<dbi_params> explicitly rather than relying on what the plugin
+defaults to. C<RaiseError: 1> is B<required> -- the engine croaks without it,
+for the reason in L</SHARING A HANDLE> -- and with C<AutoCommit> off this module
+will not commit the handle, so your sessions wait for a commit that never comes.
 
 =head2 4. From DBIx::Class
 
@@ -1646,10 +1731,16 @@ against, and failing with that sentence is more use than a SQL error.
 
 =head2 sessions_for_principal
 
-    my $ids = $engine->sessions_for_principal($principal);
+    my $digests = $engine->sessions_for_principal($principal);
 
-Returns an arrayref of unexpired session ids for a principal. Croaks if
-C<principal_key> is not configured.
+Returns an arrayref of row identifiers for a principal's unexpired sessions.
+Croaks if C<principal_key> is not configured.
+
+B<Those are digests, not session ids>, for the reason in
+L</Why the session id is stored as a digest>. Count them, compare their number
+before and after a revocation, feed them to nothing. If you want to end the
+sessions rather than look at them, L</destroy_for_principal> does it in one
+statement and never puts them in a variable.
 
 =head2 count_sessions
 
@@ -1778,6 +1869,44 @@ B<It is not built for an attacker who has the application's memory or its
 configuration.> The key is in the process, so anyone who can read the process or
 the file the key came from can read every session. Encryption at rest moves the
 secret from the database to the key store; it does not remove it.
+
+=head2 Why the session id is stored as a digest
+
+Encrypting the payload would be half a job. B<The session id is itself a bearer
+token> -- L<Dancer2> reads it from the cookie and this module hands back
+whatever it unlocks -- so a table storing ids verbatim would contain a working
+credential for every unexpired session. Someone who read a backup could replay
+any of them against a reachable instance of the application and be logged in as
+that user, B<without the encryption key and without decrypting anything>. The
+most carefully sealed payload in the world does not help if the key to the front
+door is in the same dump.
+
+So the C<id> column holds C<SHA-256> of the session id. The cookie is unchanged,
+every lookup hashes first, and what a dump yields is digests.
+
+The digest is B<unkeyed>, on purpose. A keyed digest would additionally stop an
+attacker confirming a guessed id, but Dancer2's ids are long and random, which is
+the same reason an API token needs no salt. More importantly a key here could
+never be rotated -- rotating it would orphan every live session -- and the whole
+design of L</Rotating the key> is that keys rotate. A key that cannot rotate,
+sitting among keys that must, would be a worse trap than the attack it prevents.
+
+Two consequences worth knowing:
+
+=over 4
+
+=item *
+
+C<_sessions> returns what is in the column, so the values it hands back are
+B<digests and not session ids>. They are useful for counting and for nothing
+else; you cannot turn one back into a cookie, which is the point.
+
+=item *
+
+The column is 64 hex characters rather than Dancer2's id, so size your index
+accordingly if you are tuning.
+
+=back
 
 =head2 Where the key should live
 
