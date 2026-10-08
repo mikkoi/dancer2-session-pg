@@ -215,8 +215,13 @@ T2->subtest_streamed(
         T2->ok( scalar @ids, 'the dump has rows' );
         T2->is( scalar( grep { $_ eq 'dump-victim' } @ids ),      0, 'and NONE of them is the session id itself' );
         T2->is( scalar( grep { $_ eq rid('dump-victim') } @ids ), 1, 'the row is found by digest instead' );
+
+        # EVERY id, not the first one: the claim is a property of the whole
+        # column, and a regression that stored a later session id verbatim
+        # would have passed a check of @ids[0] alone.
         ## no critic (RegularExpressions::ProhibitEnumeratedClasses) -- hex is ASCII; [[:xdigit:]] is Unicode-aware and allows A-F, which sha256_hex never emits
-        T2->like( $ids[0], qr/\A[0-9a-f]{64}\z/msx, 'every stored id is a SHA-256 digest' );
+        my @not_digests = grep { !m/\A[0-9a-f]{64}\z/msx } @ids;
+        T2->is( [@not_digests], [], 'every stored id in the dump is a SHA-256 digest' );
 
         # The crucial part: presenting what the dump contains does not work.
         # Dancer2 would hand `id` straight to _retrieve as the cookie value.
