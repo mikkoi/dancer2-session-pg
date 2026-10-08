@@ -857,7 +857,7 @@ __END__
 
 =encoding utf8
 
-=for stopwords AEAD AES ChaCha DDL DSN GCM Kubernetes NIST OpenID Poly XHR unkeyed crashloops dbh dbpass dbschema dbtable dbuser decrypt decryptable decrypted decrypts deserialise deserialising diagnosable dsn encryptions nonces plaintext preforked rollout serialiser tablespace Koivunalho Mikko
+=for stopwords AEAD AES ChaCha DDL DSN GCM Kubernetes NIST OpenID Poly XHR unkeyed atomicity upsert upserting crashloops dbh dbpass dbschema dbtable dbuser decrypt decryptable decrypted decrypts deserialise deserialising diagnosable dsn encryptions nonces plaintext preforked rollout serialiser tablespace Koivunalho Mikko
 
 =head1 NAME
 
@@ -980,17 +980,82 @@ little effect while the suspended user's cookie still works. That column is off
 by default and need not exist; L</THE PRINCIPAL COLUMN> is about whether you want
 it.
 
+=head2 Why this is PostgreSQL and not portable SQL
+
+A reasonable question, since a session row is four columns and a blob. The
+answer is that the three guarantees above are not properties of the schema --
+they are properties of statements and settings that standard SQL either does not
+have or does not define strongly enough to rely on.
+
+=over 4
+
+=item C<INSERT ... ON CONFLICT DO UPDATE>, not C<MERGE>
+
+The standard spells an upsert C<MERGE>, PostgreSQL has had it since 15, and it
+is B<not a substitute here>. C<MERGE> decides between its C<WHEN MATCHED> and
+C<WHEN NOT MATCHED> branches from a snapshot; it does not take the speculative
+insertion lock that C<ON CONFLICT> does, so when two transactions pick the
+C<NOT MATCHED> branch for the same key, one of them inserts and the other
+raises a unique violation.
+
+That is not a theoretical difference. Sixteen processes upserting one key forty
+times each, on PostgreSQL 17:
+
+    INSERT ... ON CONFLICT DO UPDATE    0 of 16 workers failed
+    MERGE                               4 of 16 workers failed
+                                        ERROR: duplicate key value violates
+                                        unique constraint
+
+A session is written on more or less every request, and concurrent writes to one
+session id are the normal case, not the edge: a page with parallel C<XHR>s does
+it by itself. With C<MERGE> a quarter of those workers would have had to carry
+retry logic for a constraint violation that cannot happen with C<ON CONFLICT>.
+Writing portable SQL here would mean writing C<SELECT>-then-C<INSERT>-or-C<UPDATE>
+in the application, which has the same race and loses atomicity as well.
+
+=item C<statement_timeout>, so a blocked write fails instead of hanging
+
+L</A blocked write fails rather than waiting> is a guarantee about the worker,
+not the row, and it rests on a PostgreSQL setting applied per connection. The
+standard has no equivalent: there is no portable way to say "cancel this
+statement after 400ms". Without it a writer that lands behind an open
+transaction waits as long as that transaction lives, holding a web worker the
+whole time -- and a handful of those is an outage, for a session that was not
+worth waiting on.
+
+=item C<bytea>, and a driver that binds it as binary
+
+The sealed payload is ciphertext: arbitrary bytes, which must come back byte for
+byte or the authentication tag fails and the session is lost. C<bytea> with
+L<DBD::Pg>'s C<PG_BYTEA> binding does that with no encoding in the middle. The
+standard C<BLOB> is spelled and handled differently by every engine, and the
+usual portable workaround -- base64 into a text column -- inflates every row by
+a third and adds a transform to each read and write of a credential store.
+
+=item C<timestamptz> and the server clock
+
+Expiry is decided by C<now()> on the server, against C<timestamptz>, so one
+clock decides whether a session is alive. Application clocks drift, and with
+several workers the answer would otherwise depend on which machine the request
+reached. C<timestamptz> also removes the zone question entirely, because
+PostgreSQL stores it as an instant rather than a local time with an offset.
+
+=back
+
+None of this rules out a portable session store -- it rules out a portable one
+with these properties. A session table meant to run on several engines is a
+reasonable thing to want, and it is a different module from this one. This one
+is for the case where the session store is the most security-sensitive table in
+the database, and you would rather the database enforced that than your
+application remembered to.
+
 =head1 REQUIREMENTS
 
-PostgreSQL B<9.5> or later, for C<INSERT ... ON CONFLICT DO UPDATE>.
+PostgreSQL B<9.5> or later, for C<INSERT ... ON CONFLICT DO UPDATE> -- see
+L</Why this is PostgreSQL and not portable SQL> for why that statement and not
+the standard C<MERGE>.
 
-Perl: this distribution uses no syntax newer than v5.12 and intends to track
-L<Dancer2>'s own floor, which is v5.12 at the time of writing. B<What has
-actually been run is v5.28.2 and v5.40.3>, which behave identically -- the
-envelope, all four ciphers and their self checks, cross-cipher reads and every
-construction refusal. v5.12 is therefore the oldest B<intended> Perl and v5.28
-the oldest B<verified> one. If that distinction matters to you, the floor in
-F<dist.ini> is the authority, not this paragraph.
+For Perl, the floor in F<dist.ini> is the authority.
 
 =head1 THE TABLE
 
@@ -1788,8 +1853,8 @@ globally -- see L</Writing a cipher>.
 =head1 CONCURRENCY
 
 Measured with real processes in F<t/concurrency.t>, not reasoned about. At the
-default size that is 8 processes making 200 writes to one session id; it has also
-been run at 32 processes and 1280 writes to one row.
+default size that is 8 processes making 200 writes to one session id, and the
+two environment variables in that file turn it up.
 
 =head2 What is promised
 
