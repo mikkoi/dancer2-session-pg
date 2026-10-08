@@ -467,6 +467,40 @@ T2->subtest_streamed(
 # The warning that a supplied handle is in manual-commit mode, which the module
 # issues because a session write joining somebody else's transaction is real in
 # the process and absent from the database until they commit. It needs no
+# THE CODEREF FORM, which is the one the documentation recommends for
+# Dancer2::Plugin::Database and DBIx::Class -- and which was silent, because
+# BUILD cannot call a coderef (doing so would open a connection at construction,
+# the very thing the coderef form avoids) and nothing checked it later. Same
+# handle, same risk, no warning.
+T2->subtest_streamed(
+    'manual-commit mode warns for a CODEREF handle too' => sub {
+        my $handle = bless { AutoCommit => 0, RaiseError => 1 }, 'Test::Handle';
+
+        my @warnings;
+        my @logged;
+        local $SIG{'__WARN__'} = sub { push @warnings, $_[0] };
+
+        my $engine = Dancer2::Session::Pg->new(
+            dbh             => sub { $handle },
+            dbtable         => 'sessions',
+            log_cb          => sub { push @logged, "$_[0]: $_[1]" },
+            encryption_keys => { 0 => slot( $KEY32, undef, 1 ) },
+        );
+
+        T2->is( scalar @warnings, 0, 'nothing at construction -- the coderef is deliberately not called there' );
+
+        $engine->_dbh;
+        T2->is( scalar @warnings, 1, 'but the first access warns' );
+        T2->like( $warnings[0], qr/AutoCommit[ ]off/msx, 'saying what the state is' );
+        T2->is( scalar( grep { m/AutoCommit[ ]off/msx } @logged ), 1, 'and it reaches log_cb as well' );
+
+        # Once per worker, not once per request: this is on the path of every
+        # single session read and write.
+        $engine->_dbh for 1 .. 5;
+        T2->is( scalar @warnings, 1, 'and says it ONCE, however many requests follow' );
+    }
+);
+
 # PostgreSQL: the engine reads one attribute off the handle, so a blessed hashref
 # is a sufficient stand-in and this can be checked anywhere.
 T2->subtest_streamed(

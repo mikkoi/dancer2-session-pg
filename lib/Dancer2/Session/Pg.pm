@@ -247,21 +247,38 @@ sub BUILD {
     # session write joins somebody else's transaction and is durable only when
     # they commit. Say so once, loudly, rather than let it surface later as a
     # login that mysteriously did not complete.
-    if ( $self->has_dbh && ref $self->dbh ne 'CODE' && !$self->dbh->{'AutoCommit'} ) {
-        my $message =
-            'the supplied dbh has AutoCommit off. Session writes will join the '
-          . q{caller's transaction and are not durable until the caller commits. This }
-          . 'module will not commit a handle it does not own. See "SHARING A HANDLE" '
-          . 'in the docs.';
+    #
+    # Only a handle we can look at NOW. A coderef cannot be called here -- doing
+    # so would open a connection at construction, which is the whole thing the
+    # coderef form exists to avoid -- so that case is checked in _dbh instead,
+    # at the first access, where the handle is in hand.
+    $self->_warn_if_manual_commit( $self->dbh )
+      if $self->has_dbh && ref $self->dbh ne 'CODE';
 
-        # BOTH, deliberately. carp reaches an engine built by hand, where log_cb
-        # is the role's no-op default and a warning would otherwise vanish;
-        # log_cb reaches the application log of an engine Dancer2 built from
-        # config, where STDERR may go nowhere anybody reads.
-        Carp::carp "Dancer2::Session::Pg: $message";
-        $self->_report_once( 'warning', $message );
-    }
+    return;
+}
 
+# Shared by BUILD and _dbh so the two cannot drift, and keyed on one message so
+# `_report_once` suppresses the second of them.
+#
+# carp AND log_cb, deliberately: carp reaches an engine built by hand, where
+# log_cb is the role's no-op default and a warning would otherwise vanish; log_cb
+# reaches the application log of an engine Dancer2 built from config, where
+# STDERR may go nowhere anybody reads.
+sub _warn_if_manual_commit {
+    my ( $self, $handle ) = @_;
+
+    return if !$handle || $handle->{'AutoCommit'};
+
+    my $message =
+        'the supplied dbh has AutoCommit off. Session writes will join the '
+      . q{caller's transaction and are not durable until the caller commits. This }
+      . 'module will not commit a handle it does not own. See "SHARING A HANDLE" '
+      . 'in the docs.';
+
+    return if $self->_reported->{$message};
+    Carp::carp "Dancer2::Session::Pg: $message";
+    $self->_report_once( 'warning', $message );
     return;
 }
 
@@ -432,6 +449,12 @@ sub _dbh {
           . 'as a success and a failed revocation as "0 sessions". Set RaiseError => 1 on '
           . 'the handle you pass, or pass a dsn and let this module open its own.'
           if !$handle->{'RaiseError'};
+
+        # The coderef case BUILD could not reach. Warn rather than croak:
+        # AutoCommit off is a legitimate choice by the caller, who then owns the
+        # commit -- unlike RaiseError off, which leaves this module reporting
+        # nonsense. Once per worker, via the same message BUILD would have used.
+        $self->_warn_if_manual_commit($handle);
 
         return $handle;
     }
@@ -1498,9 +1521,16 @@ half-finished unit of work into a permanent one is a worse failure than a sessio
 that waits for its caller.
 
 So the rule is: with C<AutoCommit> off on a shared handle, B<commit is yours>.
-The module warns once at construction if it sees that state, because a session
+The module says so once per worker if it sees that state, because a session
 write that is real in the process but not yet in the database is exactly the sort
 of thing that resurfaces later as a login that did not complete.
+
+B<When> it says so depends on which form you used, and the difference is not
+cosmetic. A handle passed directly is inspected at construction, so the warning
+arrives at startup. A B<coderef> cannot be: calling it there would open a
+connection during construction, which is the one thing the coderef form exists
+to avoid. So that handle is inspected at its first use instead, and the warning
+arrives with the first request rather than at startup.
 
 If you would rather not think about it, do not share the handle: give this module
 a C<dsn> and it opens its own connection with C<AutoCommit> on, where the question
