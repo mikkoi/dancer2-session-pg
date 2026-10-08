@@ -34,7 +34,21 @@ sub provision {
         return;
     }
 
-    my $dbh = DBI->connect( "dbi:Pg:dbname=$name", q{}, q{}, { AutoCommit => 1, RaiseError => 1, PrintError => 0 } );
+    # RaiseError is on, so this THROWS on failure -- and at this point createdb
+    # has already succeeded while nothing is registered in @CLEANUP yet. Left
+    # bare it turns a skip into a hard failure AND leaks the database, which
+    # defeats the whole point of returning a reason instead of dying: a cluster
+    # that accepts createdb but refuses a connection (pg_hba, a vanished socket,
+    # max_connections) is exactly the case this function exists to skip on.
+    my $dbh = eval { DBI->connect( "dbi:Pg:dbname=$name", q{}, q{}, { AutoCommit => 1, RaiseError => 1, PrintError => 0 } ); };
+
+    if ( !$dbh ) {
+        my $why = $EVAL_ERROR || 'DBI->connect returned no handle';
+        $why =~ s/\s+\z//msx;
+        system 'dropdb', '--if-exists', $name;    # nothing is registered yet, so drop it here
+        $REASON = "created database '$name' but could not connect to it: $why";
+        return;
+    }
 
     if ( $ENV{'SESSION_PG_TEST_KEEP_DB'} ) {
         push @CLEANUP, sub { warn "SessionPgTest::PgDB: database '$name' KEPT; drop it with: dropdb $name\n" };

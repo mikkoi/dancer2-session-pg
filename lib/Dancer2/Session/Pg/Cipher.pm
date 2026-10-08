@@ -4,7 +4,8 @@ use strict;
 use warnings;
 
 use Moo::Role;
-use Carp qw( croak );
+use Carp            qw( croak );
+use Module::Runtime qw( use_module );
 
 our $VERSION = '0.001';
 
@@ -89,6 +90,74 @@ sub cipher_self_check {    ## no critic (Subroutines::ProhibitExcessComplexity) 
       . 'a payload sealed for one session id would open under another'
       if defined $wrong_aad;
 
+    $self->_check_reserved_cipher_id( $key, $iv, $plain, $aad );
+
+    return 1;
+}
+
+# WHAT CLAIMING A BUILT-IN ID PROMISES, enforced rather than documented.
+#
+# The id is one byte of every stored row and it is how a reader decides which
+# cipher to hand a payload to. So a class claiming a built-in id is making a
+# specific promise -- "I am that cipher, byte for byte" -- and the reason to
+# allow it at all is the legitimate case: a different implementation of the same
+# algorithm, hardware-accelerated or audited or vendored, that must read every
+# row the original wrote.
+#
+# The accident is the common case, though. The documentation used to say "an
+# integer in 1..255" and nothing else, so an author writing a genuinely new
+# cipher would reasonably pick 1 -- and then every row AES-128-GCM had written
+# became unreadable, with the header agreeing about the id and the tag failing.
+# Prose does not stop that. A round trip does.
+#
+# Both directions, because both happen: the engine must read what the built-in
+# wrote before the swap, and the built-in must read what the claimant wrote if it
+# is ever removed. A cipher that passes only one way is not a drop-in.
+my %CORE_CIPHER_FOR_ID = (
+    1 => [ 'Dancer2::Session::Pg::Cipher::AESGCM', key_bytes => 16 ],
+    2 => [ 'Dancer2::Session::Pg::Cipher::AESGCM', key_bytes => 24 ],
+    3 => [ 'Dancer2::Session::Pg::Cipher::AESGCM', key_bytes => 32 ],
+    4 => ['Dancer2::Session::Pg::Cipher::ChaCha20Poly1305'],
+);
+
+sub _check_reserved_cipher_id {
+    my ( $self, $key, $iv, $plain, $aad ) = @_;
+
+    my $class = ref $self ? ref $self : $self;
+    my $id    = $self->cipher_id;
+    my $spec  = $CORE_CIPHER_FOR_ID{$id};
+
+    return 1 if !$spec;                   # 5..255: nobody else's business
+    my ( $core_class, @core_args ) = @{$spec};
+    return 1 if $class eq $core_class;    # the built-in itself
+
+    my $core = use_module($core_class)->new(@core_args);
+
+    # Declared lengths first: a mismatch here is the same fault with a clearer
+    # name than a round trip that merely fails.
+    for my $method (qw( key_bytes iv_bytes tag_bytes )) {
+        next if $self->$method == $core->$method;
+        croak sprintf '%s: cipher_id %d is %s, whose %s is %d, but this cipher says %d. '
+          . 'An id identifies one stored format; pick an unused id in 128..255 instead',
+          $class, $id, $core->cipher_name, $method, $core->$method, $self->$method;
+    }
+
+    my $fail =
+        sprintf '%s: cipher_id %d belongs to %s, and claiming it means being able to '
+      . 'read and write that cipher\'s rows byte for byte. This cipher cannot (%%s). '
+      . 'If it is a NEW cipher rather than a replacement, pick an unused id in 128..255',
+      $class, $id, $core->cipher_name;
+
+    my ( $core_ct, $core_tag ) = $core->seal( $key, $iv, $plain, $aad );
+    my $read = eval { $self->unseal( $key, $iv, $core_ct, $core_tag, $aad ) };
+    croak sprintf $fail, 'it cannot read what ' . $core->cipher_name . ' wrote'
+      if !defined $read || $read ne $plain;
+
+    my ( $own_ct, $own_tag ) = $self->seal( $key, $iv, $plain, $aad );
+    my $back = eval { $core->unseal( $key, $iv, $own_ct, $own_tag, $aad ) };
+    croak sprintf $fail, $core->cipher_name . ' cannot read what it wrote'
+      if !defined $back || $back ne $plain;
+
     return 1;
 }
 
@@ -98,7 +167,7 @@ __END__
 
 =encoding utf8
 
-=for stopwords AEAD AES ChaCha DDL DSN GCM Kubernetes NIST OpenID Poly XHR crashloops dbh dbpass dbschema dbtable dbuser decrypt decryptable decrypted decrypts deserialise deserialising diagnosable dsn encryptions nonces plaintext preforked rollout serialiser tablespace Koivunalho Mikko
+=for stopwords AEAD AES ChaCha DDL DSN GCM Kubernetes NIST OpenID Poly XHR crashloops dbh dbpass dbschema dbtable dbuser decrypt decryptable decrypted decrypts deserialise deserialising diagnosable dsn encryptions nonces plaintext preforked rollout serialiser tablespace Koivunalho Mikko vendored
 
 =head1 NAME
 
@@ -204,18 +273,26 @@ not available for reuse:
     4    ChaCha20-Poly1305      (Dancer2::Session::Pg::Cipher::ChaCha20Poly1305)
 
 B<Pick from C<128 .. 255> for a cipher of your own.> The low numbers are left
-for further built-ins, and the engine refuses a ring in which two different
-classes claim one id -- so a collision is caught at construction rather than at
-somebody's next login, but only when both are configured at once. A class that
-claims a taken id while the built-in is absent will read its own writes happily
-and then fail to open anything written before it, with the header agreeing and
-the tag not.
+for further built-ins.
 
-Claiming one of the four ON PURPOSE is a legitimate thing to do, and means
-exactly one thing: B<this class is a byte-compatible drop-in> for that cipher,
-able to read every row the original wrote -- a different implementation of the
-same algorithm, not a different algorithm. If it cannot read those rows, it
-needs its own id.
+Claiming one of the four ON PURPOSE is a legitimate thing to do -- a
+hardware-accelerated, audited or vendored implementation of the same algorithm
+has to keep the id, or it could not read the rows it is replacing. But it means
+exactly one thing, B<this class is a byte-compatible drop-in for that cipher>,
+and L</cipher_self_check> B<enforces it> rather than trusting it: a class
+claiming a reserved id must read a payload the built-in wrote, and the built-in
+must read one it wrote. Both directions, because both happen -- the engine reads
+old rows after the swap, and the built-in reads the replacement's rows if it is
+ever taken out again.
+
+So a NEW cipher that takes a reserved id is refused at construction, with the
+range to use instead. Without that check it would have worked perfectly on an
+empty table and then failed to open a single row written before it, the stored
+header agreeing about the cipher and the tag disagreeing about everything else.
+
+Two ciphers colliding inside C<128 .. 255> are a separate matter, and the engine
+refuses that ring too -- but only when both are configured at once, which is all
+it can see.
 
 =head2 cipher_name
 

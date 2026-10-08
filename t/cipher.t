@@ -144,10 +144,44 @@ my %EXPECTED = (
     extends 'Test::Cipher::Base';
     sub cipher_id { return 0 }
 
-    package Test::Cipher::ClashesWithChaCha;                       # correct, but takes a taken id
+    # Claims AES-256-GCM's id while being a different format entirely. The
+    # accident the reserved-id check exists to catch.
+    package Test::Cipher::StealsAesId;
     use Moo;
     extends 'Test::Cipher::Base';
-    sub cipher_id { return 4 }
+    sub cipher_id   { return 3 }
+    sub cipher_name { return 'StealsAesId' }
+
+    # Claims AES-256-GCM's id and IS AES-256-GCM, by delegation -- the
+    # legitimate case: a replacement implementation that can read every row the
+    # original wrote. This one must be ACCEPTED.
+    package Test::Cipher::RealAesDropIn;
+    use Moo;
+    use Dancer2::Session::Pg::Cipher::AESGCM ();
+    has _inner => ( is => 'lazy', builder => sub { Dancer2::Session::Pg::Cipher::AESGCM->new( key_bytes => 32 ) } );
+    sub cipher_id   { return 3 }
+    sub cipher_name { return 'RealAesDropIn' }
+    sub key_bytes   { return 32 }
+    sub iv_bytes    { return 12 }
+    sub tag_bytes   { return 16 }
+    sub seal        { my ( $self, @a ) = @_; return $self->_inner->seal(@a) }
+    sub unseal      { my ( $self, @a ) = @_; return $self->_inner->unseal(@a) }
+    with 'Dancer2::Session::Pg::Cipher';
+
+    # Two correct ciphers in the third-party range that happen to pick the
+    # same id. Nothing reserved is involved: this is the collision the ENGINE
+    # catches when it builds the ring, not the one the role catches per cipher.
+    package Test::Cipher::ThirdPartyTwoHundred;
+    use Moo;
+    extends 'Test::Cipher::Base';
+    sub cipher_id   { return 200 }
+    sub cipher_name { return 'ThirdPartyTwoHundred' }
+
+    package Test::Cipher::AlsoTwoHundred;
+    use Moo;
+    extends 'Test::Cipher::Base';
+    sub cipher_id   { return 200 }
+    sub cipher_name { return 'AlsoTwoHundred' }
 }
 
 T2->subtest_streamed(
@@ -678,18 +712,32 @@ T2->subtest_streamed(
                 sub { engine( encryption_keys => { '007' => slot( $KEY32, undef, 1 ) } ) },
             ],
 
+            # An id names one stored format. Claiming a built-in's id promises
+            # byte compatibility with it, and that promise is now checked
+            # rather than documented.
+            [
+                q{a new cipher that helps itself to AES-256-GCM's id},
+                qr/claiming[ ]it[ ]means[ ]being[ ]able/msx,
+                sub { engine( encryption_keys => { 0 => slot( $KEY32, 'Test::Cipher::StealsAesId', 1 ) } ) },
+            ],
+            [
+                'and the refusal says where to get an id of its own',
+                qr/128[.][.]255/msx,
+                sub { engine( encryption_keys => { 0 => slot( $KEY32, 'Test::Cipher::StealsAesId', 1 ) } ) },
+            ],
+
             # Several slots MAY share a cipher -- that is an ordinary key
             # rotation. Two different classes claiming one id may not: the
             # header's cipher byte is what diagnoses a slot whose alg was
             # edited in place, and it could not tell them apart.
             [
-                'two cipher classes claiming one cipher id',
+                'two third-party classes claiming one cipher id',
                 qr/claimed[ ]by[ ]both/msx,
                 sub {
                     engine(
                         encryption_keys => {
-                            0 => slot( $KEY32, 'ChaCha20-Poly1305', 1 ),
-                            1 => slot( $KEY32, 'Test::Cipher::ClashesWithChaCha' ),
+                            0 => slot( $KEY32, 'Test::Cipher::ThirdPartyTwoHundred', 1 ),
+                            1 => slot( $KEY32, 'Test::Cipher::AlsoTwoHundred' ),
                         }
                     );
                 },
@@ -763,6 +811,33 @@ T2->subtest_streamed(
             T2->ok( !$ok, "refused: $what" );
             T2->like( $EVAL_ERROR, $expected, 'and the message names the attribute or the reason' );
         }
+    }
+);
+
+# The check has to let the legitimate case through, or it is just a ban on
+# replacing a built-in -- which is a thing somebody will need to do (a
+# hardware-accelerated or audited AES, vendored for one deployment).
+T2->subtest_streamed(
+    'a genuine drop-in may claim the built-in id it replaces' => sub {
+        my $engine = engine( encryption_keys => { 0 => slot( $KEY32, 'Test::Cipher::RealAesDropIn', 1 ) } );
+        T2->ok( $engine, 'a byte-compatible replacement is accepted for cipher id 3' );
+
+        # And the point of allowing it: rows written by the built-in open under
+        # the replacement, and the other way round.
+        my $built_in = engine( encryption_keys => { 0 => slot( $KEY32, 'AES-256-GCM', 1 ) } );
+        my $old_row  = $built_in->_encrypt( 'sid', { written_by => 'built-in' } );
+        T2->is(
+            $engine->_decrypt( 'sid', $old_row ),
+            { written_by => 'built-in' },
+            'the replacement reads a row the built-in wrote'
+        );
+
+        my $new_row = $engine->_encrypt( 'sid', { written_by => 'replacement' } );
+        T2->is(
+            $built_in->_decrypt( 'sid', $new_row ),
+            { written_by => 'replacement' },
+            'and the built-in reads a row the replacement wrote'
+        );
     }
 );
 
