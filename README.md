@@ -209,14 +209,7 @@ PostgreSQL **9.5** or later, for `INSERT ... ON CONFLICT DO UPDATE` -- see
 that statement and not
 the standard `MERGE`.
 
-Perl **v5.14** or later. That number comes from [Dancer2](https://metacpan.org/pod/Dancer2), not from this
-module: Dancer2 2.x declares `perl 5.014` in its metadata, so no version of
-this engine can install anywhere Dancer2 cannot. Nothing here uses syntax newer
-than v5.12, which is what `Dancer2.pm` itself still says in its own `use`
-line -- but the installable floor is the one its metadata sets, and that is
-v5.14.
-
-The prerequisites in `dist.ini` are the authority if the two ever disagree.
+Perl **v5.14** or later (Dancer2's required Perl as per [Dancer2](https://metacpan.org/pod/Dancer2) **v1.0.0**).
 
 
 ## 💻 Contributors

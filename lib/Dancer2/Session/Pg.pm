@@ -1091,14 +1091,7 @@ L<Dancer2::Session::Pg/Why this is PostgreSQL and not portable SQL> for why
 that statement and not
 the standard C<MERGE>.
 
-Perl B<v5.14> or later. That number comes from L<Dancer2>, not from this
-module: Dancer2 2.x declares C<perl 5.014> in its metadata, so no version of
-this engine can install anywhere Dancer2 cannot. Nothing here uses syntax newer
-than v5.12, which is what C<Dancer2.pm> itself still says in its own C<use>
-line -- but the installable floor is the one its metadata sets, and that is
-v5.14.
-
-The prerequisites in F<dist.ini> are the authority if the two ever disagree.
+Perl B<v5.14> or later (Dancer2's required Perl as per L<Dancer2> B<v1.0.0>).
 
 =head1 THE TABLE
 
