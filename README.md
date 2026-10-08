@@ -54,6 +54,155 @@ Most applications configure this from `config.yml` rather than in Perl -- see
 be a coderef, something YAML cannot express, and there is a trap in doing it
 which ["CONNECTIONS"](#connections) describes.
 
+# DESCRIPTION
+
+Stores Dancer2 sessions in PostgreSQL, and uses PostgreSQL's own features to
+make that storage safer than a serialised blob in a table.
+
+A web session is not ordinary data. It frequently carries the credentials that
+prove who somebody is -- with OpenID Connect, an access token and a refresh
+token -- so the store is worth more than the account it belongs to. Three
+properties follow from that, and each is provided by the database rather than by
+convention:
+
+- Authenticated encryption at rest
+
+    The payload is encrypted with an AEAD cipher, so a dump, a backup or a support
+    copy of the table does not hand over the contents of a session, and a row that
+    has been altered fails to decrypt instead of deserialising into a structure the
+    application would then trust.
+
+    Nor does it hand over a way in. **The session id is stored as a SHA-256 digest,
+    not verbatim**, because the id is the session cookie: a table full of raw ids
+    would be a table full of working credentials, usable against the live
+    application by anyone who read a backup, no key required. What a dump contains
+    is digests, which open nothing.
+
+    The id is also authenticated with the payload, so a sealed payload opens only
+    under the session it was written for and cannot be moved from one row to
+    another.
+    ["SECURITY"](#security) says what that stops, where the key should live, and when to rotate
+    it.
+
+    Which cipher is a property of the key it is used with, and both are
+    **replaceable**: every payload records the key and the cipher that sealed it, so
+    a cipher found wanting next year is three deployments rather than a forced
+    logout. See ["THE STORED PAYLOAD"](#the-stored-payload), ["Rotating the key"](#rotating-the-key) and
+    [Dancer2::Session::Pg::Cipher](https://metacpan.org/pod/Dancer2%3A%3ASession%3A%3APg%3A%3ACipher).
+
+- Expiry decided by the server's clock
+
+    `expires` is a `timestamptz` and every read filters on it. Application clocks
+    drift; the database's clock is the one every process shares, so all of them
+    agree about whether a session is still alive.
+
+    The expiry is set when the row is created and **is not moved by later writes**.
+    `session_duration` is therefore an absolute cap measured from creation, which is
+    what [Dancer2::Core::Role::SessionFactory](https://metacpan.org/pod/Dancer2%3A%3ACore%3A%3ARole%3A%3ASessionFactory) describes: a limit on session
+    validity, regardless of the cookie. An idle timeout is a different thing and is
+    the cookie's job -- see `cookie_duration`, which slides.
+
+    This matters more than it sounds. A cap that every request pushes further away is
+    never reached by a session in continuous use, and a session in continuous use is
+    what somebody holding stolen cookies has.
+
+- Atomic writes
+
+    Sessions are written with `INSERT ... ON CONFLICT DO UPDATE`, which is atomic.
+    Any number of workers may write one session id concurrently without producing a
+    duplicate row, a unique violation or a deadlock, and without moving the expiry
+    cap.
+
+    That is a guarantee about database integrity, not about every write succeeding:
+    concurrent writers to one row serialise on its lock, and a waiter that exceeds
+    `statement_timeout` is cancelled on purpose rather than holding a worker. See
+    ["A blocked write fails rather than waiting"](#a-blocked-write-fails-rather-than-waiting).
+
+    It does **not** mean two workers cannot lose each other's changes. The payload is
+    one encrypted blob, so a write replaces all of it and the last writer wins. See
+    ["CONCURRENCY"](#concurrency), which says exactly what is and is not promised, and is backed by
+    a test rather than by this paragraph.
+
+On top of that, an **optional** clear column beside the encrypted payload makes it
+possible to find and end every session belonging to one account without
+decrypting anything -- see ["destroy\_for\_principal"](#destroy_for_principal). Suspending an account has
+little effect while the suspended user's cookie still works. That column is off
+by default and need not exist; ["THE PRINCIPAL COLUMN"](#the-principal-column) is about whether you want
+it.
+
+## Why this is PostgreSQL and not portable SQL
+
+A reasonable question, since a session row is four columns and a blob. The
+answer is that the three guarantees above are not properties of the schema --
+they are properties of statements and settings that standard SQL either does not
+have or does not define strongly enough to rely on.
+
+- `INSERT ... ON CONFLICT DO UPDATE`, not `MERGE`
+
+    The standard spells an upsert `MERGE`, PostgreSQL has had it since 15, and it
+    is **not a substitute here**. `MERGE` decides between its `WHEN MATCHED` and
+    `WHEN NOT MATCHED` branches from a snapshot; it does not take the speculative
+    insertion lock that `ON CONFLICT` does, so when two transactions pick the
+    `NOT MATCHED` branch for the same key, one of them inserts and the other
+    raises a unique violation.
+
+    That is not a theoretical difference. Sixteen processes upserting one key forty
+    times each, on PostgreSQL 17:
+
+        INSERT ... ON CONFLICT DO UPDATE    0 of 16 workers failed
+        MERGE                               4 of 16 workers failed
+                                            ERROR: duplicate key value violates
+                                            unique constraint
+
+    A session is written on more or less every request, and concurrent writes to one
+    session id are the normal case, not the edge: a page with parallel `XHR`s does
+    it by itself. With `MERGE` a quarter of those workers would have had to carry
+    retry logic for a constraint violation that cannot happen with `ON CONFLICT`.
+    Writing portable SQL here would mean writing `SELECT`-then-`INSERT`-or-`UPDATE`
+    in the application, which has the same race and loses atomicity as well.
+
+- `statement_timeout`, so a blocked write fails instead of hanging
+
+    ["A blocked write fails rather than waiting"](#a-blocked-write-fails-rather-than-waiting) is a guarantee about the worker,
+    not the row, and it rests on a PostgreSQL setting applied per connection. The
+    standard has no equivalent: there is no portable way to say "cancel this
+    statement after 400ms". Without it a writer that lands behind an open
+    transaction waits as long as that transaction lives, holding a web worker the
+    whole time -- and a handful of those is an outage, for a session that was not
+    worth waiting on.
+
+- `bytea`, and a driver that binds it as binary
+
+    The sealed payload is ciphertext: arbitrary bytes, which must come back byte for
+    byte or the authentication tag fails and the session is lost. `bytea` with
+    [DBD::Pg](https://metacpan.org/pod/DBD%3A%3APg)'s `PG_BYTEA` binding does that with no encoding in the middle. The
+    standard `BLOB` is spelled and handled differently by every engine, and the
+    usual portable workaround -- base64 into a text column -- inflates every row by
+    a third and adds a transform to each read and write of a credential store.
+
+- `timestamptz` and the server clock
+
+    Expiry is decided by `now()` on the server, against `timestamptz`, so one
+    clock decides whether a session is alive. Application clocks drift, and with
+    several workers the answer would otherwise depend on which machine the request
+    reached. `timestamptz` also removes the zone question entirely, because
+    PostgreSQL stores it as an instant rather than a local time with an offset.
+
+None of this rules out a portable session store -- it rules out a portable one
+with these properties. A session table meant to run on several engines is a
+reasonable thing to want, and it is a different module from this one. This one
+is for the case where the session store is the most security-sensitive table in
+the database, and you would rather the database enforced that than your
+application remembered to.
+
+# REQUIREMENTS
+
+PostgreSQL **9.5** or later, for `INSERT ... ON CONFLICT DO UPDATE` -- see
+["Why this is PostgreSQL and not portable SQL"](#why-this-is-postgresql-and-not-portable-sql) for why that statement and not
+the standard `MERGE`.
+
+For Perl, the floor in `dist.ini` is the authority.
+
 
 ## 💻 Contributors
 
