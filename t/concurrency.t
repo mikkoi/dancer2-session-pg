@@ -29,10 +29,12 @@ use English qw( -no_match_vars );
 
 use Test2::V1 qw( -utf8 -x ), -include => [ [ 'Test2::Tools::Subtest', 'subtest_streamed' ] ];
 
-use Config     qw( %Config );
-use File::Temp qw( tempfile );
-use Carp       qw( croak );
-use POSIX      ();
+use Config      qw( %Config );
+use Time::HiRes qw( time );
+use List::Util  qw( max min );
+use File::Temp  qw( tempfile );
+use Carp        qw( croak );
+use POSIX       ();
 
 use FindBin qw( $Bin );    ## no critic (Community::DiscouragedModules) -- how a test finds t/lib; the warning is for applications
 use lib "$Bin/lib";
@@ -102,6 +104,90 @@ sub in_child {    ## no critic (Subroutines::RequireFinalReturn) -- the child br
     POSIX::_exit( $ok ? 0 : 1 );
 }
 
+# WITHOUT THIS THE SUBTESTS BELOW PROVE NOTHING. Forking N workers in a loop
+# does not make them run at once: the parent forks them one at a time, and
+# worker 1 can finish all its writes before worker N is created. Every
+# assertion here would still hold -- one row, the cap intact, a payload that
+# decrypts -- because those are true of serial writes too. The test would pass
+# while never once exercising the contention it is named for.
+#
+# So: every child blocks on a pipe until the parent closes the write end, which
+# releases all of them at the same instant. A pipe rather than a sleep, because
+# a sleep is a guess about scheduling and this is not.
+sub _wait_at_gate {
+    my ( $reader, $writer ) = @_;
+
+    # The child inherits the write end too, and while ANY copy is open there is
+    # no EOF -- so the child closing its own copy is what makes the gate work.
+    close $writer or POSIX::_exit(1);
+    my $ignored = q{};
+
+    # 0 at EOF IS the signal here, so there is no return value worth checking.
+    read $reader, $ignored, 1;
+    return;
+}
+
+# Fork $count workers that all start at the same instant, and hand each one its
+# own number. The pipe, the gate and the release live here rather than in every
+# subtest that needs them -- the plumbing is identical and saying it twice
+# invites the two copies to drift.
+sub fork_at_gate {
+    my ( $count, $error_file, $code ) = @_;
+
+    pipe my $gate_r, my $gate_w or croak "pipe failed: $OS_ERROR";
+
+    my @pids;
+    for my $worker ( 1 .. $count ) {
+        push @pids, in_child(
+            sub {
+                _wait_at_gate( $gate_r, $gate_w );
+                $code->($worker);
+            },
+            $error_file,
+        );
+    }
+
+    # Every worker is now blocked on the gate. This opens it, for all at once.
+    close $gate_w or croak "cannot close the gate: $OS_ERROR";
+    return @pids;
+}
+
+# Each worker reports the wall-clock span it was busy for, so the parent can
+# show that the workers really overlapped rather than taking turns.
+sub _note_span {
+    my ( $path, $started ) = @_;
+    open my $out, '>>', $path or POSIX::_exit(1);
+    printf {$out} "%.6f %.6f\n", $started, time or POSIX::_exit(1);
+    close $out or POSIX::_exit(1);
+    return;
+}
+
+sub _spans {
+    my ($path) = @_;
+    my @spans;
+    open my $in, '<', $path or croak "cannot read $path: $OS_ERROR";
+    while ( my $line = <$in> ) {
+        chomp $line;
+        push @spans, [ $1, $2 ] if $line =~ m/\A([0-9.]+)[ ]([0-9.]+)\z/msx;    ## no critic (RegularExpressions::ProhibitEnumeratedClasses) -- [0-9.] is an ASCII float, not a Unicode digit class
+    }
+    close $in or croak "cannot close $path: $OS_ERROR";
+    return @spans;
+}
+
+# Collective busy time over wall-clock time. Workers taking turns give ~1;
+# workers running together give ~N. This does not measure the scheduler -- the
+# point is only to notice if this subtest ever stops being concurrent.
+sub _overlap {
+    my (@spans) = @_;
+    return ( 0, 0, 0 ) if !@spans;
+
+    my $busy = 0;
+    $busy += $_->[1] - $_->[0] for @spans;
+    my $wall = max( map { $_->[1] } @spans ) - min( map { $_->[0] } @spans );
+
+    return ( $wall > 0 ? $busy / $wall : 0, $busy, $wall );
+}
+
 sub _slurp {
     my ($path) = @_;
     open my $in, '<', $path or croak "cannot read $path: $OS_ERROR";
@@ -126,16 +212,20 @@ T2->subtest_streamed(
         my ( $fh, $error_file ) = tempfile( UNLINK => 1 );
         close $fh or croak "cannot close the temporary file: $OS_ERROR";
 
-        my @pids;
-        for my $worker ( 1 .. $WORKERS ) {
-            push @pids, in_child(
-                sub {
-                    my $engine = engine();
-                    $engine->_flush( 'hot', { writer => $worker, n => $_ } ) for 1 .. $WRITES;
-                },
-                $error_file,
-            );
-        }
+        my ( $sfh, $span_file ) = tempfile( UNLINK => 1 );
+        close $sfh or croak "cannot close the temporary file: $OS_ERROR";
+
+        my @pids = fork_at_gate(
+            $WORKERS,
+            $error_file,
+            sub {
+                my ($worker) = @_;
+                my $engine   = engine();
+                my $started  = time;
+                $engine->_flush( 'hot', { writer => $worker, n => $_ } ) for 1 .. $WRITES;
+                _note_span( $span_file, $started );
+            }
+        );
 
         my $failed = reap_children(@pids);
 
@@ -143,6 +233,24 @@ T2->subtest_streamed(
         T2->is( $failed, 0,   "all $WORKERS workers completed " . $WORKERS * $WRITES . ' writes without error' );
         T2->is( $errors, q{}, 'and nothing was recorded -- no deadlock, no unique violation' )
           or T2->diag($errors);
+
+        # AND THE WORKERS REALLY OVERLAPPED, which is the part a passing
+        # assertion above does not establish. If they had taken turns, the time
+        # they were collectively busy would equal the wall-clock time the whole
+        # thing took; running at once, it is a multiple of it. Stated as a ratio
+        # rather than an absolute so it means the same on a fast machine and a
+        # loaded one, and loosely (1.5x of a possible 8x) so it is not flaky --
+        # this exists to catch a test that has stopped being concurrent, not to
+        # measure the scheduler.
+        my @spans = _spans($span_file);
+        T2->is( scalar @spans, $WORKERS, 'every worker reported the span it was busy for' );
+
+        my ( $ratio, $busy, $wall ) = _overlap(@spans);
+        T2->ok(
+            $ratio > 1.5,
+            sprintf 'and they ran CONCURRENTLY: %.1fx overlap (%.3fs of work in %.3fs of wall clock)',
+            $ratio, $busy, $wall
+        ) or T2->diag('the workers appear to have run one after another, so this subtest did not test contention');
 
         my ($rows) = $dbh->selectrow_array( "SELECT count(*) FROM $SCHEMA.sessions WHERE id = ?", undef, rid('hot') );
         T2->is( $rows, 1, 'ON CONFLICT left exactly one row, not one per worker' );
@@ -172,10 +280,14 @@ T2->subtest_streamed(
         my ( $fh, $error_file ) = tempfile( UNLINK => 1 );
         close $fh or croak "cannot close the temporary file: $OS_ERROR";
 
-        my @pids;
-        for my $worker ( 1 .. $WORKERS ) {
-            push @pids, in_child( sub { engine()->_flush( "own-$worker", { writer => $worker } ) }, $error_file );
-        }
+        my @pids = fork_at_gate(
+            $WORKERS,
+            $error_file,
+            sub {
+                my ($worker) = @_;
+                engine()->_flush( "own-$worker", { writer => $worker } );
+            }
+        );
 
         T2->is( reap_children(@pids), 0, 'every worker wrote its own session' );
 

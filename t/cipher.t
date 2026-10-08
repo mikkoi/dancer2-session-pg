@@ -83,17 +83,27 @@ my %EXPECTED = (
         my ( $payload, $aad ) = @_;
         return sprintf '%016d', unpack '%32C*', $payload . ( defined $aad ? $aad : q{} );
     }
-    sub cipher_id   { return 200 }                                                          # the third-party range
+
+    # A toy TRANSFORM, so these fixtures are not themselves what
+    # cipher_self_check now refuses: a cipher that returns the plaintext as its
+    # ciphertext would store sessions in the clear, however sound its tag. XOR
+    # is not encryption and is not pretending to be -- it is the smallest thing
+    # that makes the ciphertext differ from the plaintext and reverses cleanly.
+    sub _hide {
+        my ($bytes) = @_;
+        return pack 'C*', map { $_ ^ 0x5A } unpack 'C*', $bytes;
+    }
+    sub cipher_id   { return 200 }                                                                           # the third-party range
     sub cipher_name { return 'Test' }
     sub key_bytes   { return 32 }
     sub iv_bytes    { return 12 }
     sub tag_bytes   { return 16 }
-    sub seal        { my ( $s, $k, $i, $p, $aad ) = @_; return ( $p, _tag( $p, $aad ) ) }
+    sub seal        { my ( $s, $k, $i, $p, $aad ) = @_; my $c = _hide($p); return ( $c, _tag( $c, $aad ) ) }
 
-    sub unseal {                                                                            ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
+    sub unseal {                                                                                             ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
         my ( $s, $k, $i, $c, $t, $aad ) = @_;
         return () if !defined $t || $t ne _tag( $c, $aad );
-        return $c;
+        return _hide($c);
     }
     with 'Dancer2::Session::Pg::Cipher';
 
@@ -106,7 +116,7 @@ my %EXPECTED = (
 
     sub unseal {    ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
         my ( $s, $k, $i, $c, $t, $aad ) = @_;
-        return $c;
+        return Test::Cipher::Base::_hide($c);    ## no critic (Subroutines::ProtectPrivateSubs) -- the toy cipher reuses the base transform on purpose
     }
 
     # Authenticates the payload properly and DROPS THE ADDITIONAL DATA. The
@@ -119,14 +129,15 @@ my %EXPECTED = (
 
     sub seal {
         my ( $s, $k, $i, $p, $aad ) = @_;
-        return ( $p, Test::Cipher::Base::_tag($p) );    ## no critic (Subroutines::ProtectPrivateSubs) -- the toy cipher deliberately reuses the base tag
+        my $c = Test::Cipher::Base::_hide($p);          ## no critic (Subroutines::ProtectPrivateSubs) -- the toy cipher reuses the base transform on purpose
+        return ( $c, Test::Cipher::Base::_tag($c) );    ## no critic (Subroutines::ProtectPrivateSubs) -- and the base tag, deliberately without the aad
     }
 
     sub unseal {                                        ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
         my ( $s, $k, $i, $c, $t, $aad ) = @_;
         return ()
           if !defined $t || $t ne Test::Cipher::Base::_tag($c);    ## no critic (Subroutines::ProtectPrivateSubs) -- the format and the crypto live here, so they are tested directly
-        return $c;
+        return Test::Cipher::Base::_hide($c);                      ## no critic (Subroutines::ProtectPrivateSubs) -- the toy cipher reuses the base transform on purpose
     }
 
     package Test::Cipher::ShortTag;                                # lies about tag_bytes
@@ -143,6 +154,32 @@ my %EXPECTED = (
     use Moo;
     extends 'Test::Cipher::Base';
     sub cipher_id { return 0 }
+
+    # AUTHENTICATES PERFECTLY AND DOES NOT ENCRYPT. Real tag over the payload,
+    # refuses every forgery, honours the additional data, round trips -- and
+    # hands back the plaintext as its ciphertext, so sessions would sit in the
+    # database in the clear. Until cipher_self_check compared the two, this
+    # passed every check it made.
+    package Test::Cipher::NeverEncrypts;
+    use Moo;
+    extends 'Test::Cipher::Base';
+    sub cipher_id   { return 201 }
+    sub cipher_name { return 'NeverEncrypts' }
+    sub seal        { my ( $s, $k, $i, $p, $aad ) = @_; return ( $p, Test::Cipher::Base::_tag( $p, $aad ) ) }    ## no critic (Subroutines::ProtectPrivateSubs) -- the toy cipher reuses the base tag
+
+    sub unseal {                                                                                                 ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
+        my ( $s, $k, $i, $c, $t, $aad ) = @_;
+        return () if !defined $t || $t ne Test::Cipher::Base::_tag( $c, $aad );                                  ## no critic (Subroutines::ProtectPrivateSubs) -- as above
+        return $c;
+    }
+
+    # Correct in every way except that it squats on an id the core has reserved
+    # but not yet used, which would collide with a future built-in.
+    package Test::Cipher::SquatsOnUnusedCoreId;
+    use Moo;
+    extends 'Test::Cipher::Base';
+    sub cipher_id   { return 5 }
+    sub cipher_name { return 'SquatsOnUnusedCoreId' }
 
     # Claims AES-256-GCM's id while being a different format entirely. The
     # accident the reserved-id check exists to catch.
@@ -710,6 +747,24 @@ T2->subtest_streamed(
                 q{a non-canonical slot id, '007'},
                 qr/canonical[ ]integer/msx,
                 sub { engine( encryption_keys => { '007' => slot( $KEY32, undef, 1 ) } ) },
+            ],
+
+            # The gap every other check in cipher_self_check left open: all of
+            # them test AUTHENTICATION, and a cipher can authenticate flawlessly
+            # while storing the session in the clear.
+            [
+                'a cipher that authenticates but never encrypts',
+                qr/stored[ ]in[ ]the[ ]clear/msx,
+                sub { engine( encryption_keys => { 0 => slot( $KEY32, 'Test::Cipher::NeverEncrypts', 1 ) } ) },
+            ],
+
+            # 1..127 is the core's whether or not a built-in uses it yet. There
+            # is no interop check to offer for an unused id -- nothing to interop
+            # with -- so the answer is simply no.
+            [
+                'a cipher squatting on a reserved id the core has not used yet',
+                qr/reserves[ ]for[ ]its[ ]own[ ]ciphers/msx,
+                sub { engine( encryption_keys => { 0 => slot( $KEY32, 'Test::Cipher::SquatsOnUnusedCoreId', 1 ) } ) },
             ],
 
             # An id names one stored format. Claiming a built-in's id promises

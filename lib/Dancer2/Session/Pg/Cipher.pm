@@ -49,6 +49,24 @@ sub cipher_self_check {    ## no critic (Subroutines::ProhibitExcessComplexity) 
       ( defined $tag ? length $tag : 0 ), $self->tag_bytes
       if !defined $tag || length $tag != $self->tag_bytes;
 
+    # THE ONE THING THE REST OF THIS CHECK WOULD MISS. Everything above and
+    # below tests AUTHENTICATION -- that the tag is real, that altered input is
+    # refused, that the additional data is bound in. A cipher that computes a
+    # genuine MAC over the plaintext and then returns the plaintext as its
+    # ciphertext passes every one of those, round trips perfectly, refuses
+    # every forgery -- and writes sessions to the database IN THE CLEAR.
+    #
+    # That is not a hypothetical shape: it is what an encrypt-then-MAC wrapper
+    # degrades into if the author returns the wrong variable, and the failure
+    # is invisible from outside because every test of correctness still
+    # passes. For a module whose only purpose is encryption at rest, not
+    # checking that the cipher encrypts is the one omission that matters.
+    croak "$class: seal returned the plaintext unchanged as its ciphertext, so every "
+      . 'session would be stored in the clear. The tag may well be sound -- this is '
+      . 'what an encrypt-then-MAC implementation looks like when it returns the '
+      . 'plaintext instead of the encrypted bytes.'
+      if $ciphertext eq $plain;
+
     my $back = eval { $self->unseal( $key, $iv, $ciphertext, $tag, $aad ) };
     croak "$class: unseal did not return what seal was given"
       if !defined $back || $back ne $plain;
@@ -113,6 +131,10 @@ sub cipher_self_check {    ## no critic (Subroutines::ProhibitExcessComplexity) 
 # Both directions, because both happen: the engine must read what the built-in
 # wrote before the swap, and the built-in must read what the claimant wrote if it
 # is ever removed. A cipher that passes only one way is not a drop-in.
+# The core reserves 1..127; 128..255 belongs to whoever deploys a cipher of
+# their own, where a collision is theirs to manage.
+use constant CORE_ID_MAX => 128;
+
 my %CORE_CIPHER_FOR_ID = (
     1 => [ 'Dancer2::Session::Pg::Cipher::AESGCM', key_bytes => 16 ],
     2 => [ 'Dancer2::Session::Pg::Cipher::AESGCM', key_bytes => 24 ],
@@ -127,7 +149,19 @@ sub _check_reserved_cipher_id {
     my $id    = $self->cipher_id;
     my $spec  = $CORE_CIPHER_FOR_ID{$id};
 
-    return 1 if !$spec;                   # 5..255: nobody else's business
+    # 5..127 is reserved for built-ins that do not exist yet. Refusing it is the
+    # point: a third-party cipher that takes id 5 today works perfectly until
+    # this distribution ships a built-in with that id, and then two different
+    # formats share one header byte and the older rows become unreadable. There
+    # is no interop check to offer, because there is nothing yet to interop
+    # with -- so the only safe answer is no.
+    croak sprintf '%s: cipher_id %d is in the range 1..127, which this distribution '
+      . 'reserves for its own ciphers -- %d is not in use yet, and claiming it now '
+      . 'would collide with a future built-in and make these rows unreadable. '
+      . 'Pick an unused id in 128..255', $class, $id, $id
+      if !$spec && $id < CORE_ID_MAX;
+
+    return 1 if !$spec;                   # 128..255: the third-party range
     my ( $core_class, @core_args ) = @{$spec};
     return 1 if $class eq $core_class;    # the built-in itself
 
@@ -272,8 +306,11 @@ not available for reuse:
     3    AES-256-GCM            (the same class, 32-byte key)
     4    ChaCha20-Poly1305      (Dancer2::Session::Pg::Cipher::ChaCha20Poly1305)
 
-B<Pick from C<128 .. 255> for a cipher of your own.> The low numbers are left
-for further built-ins.
+B<Pick from C<128 .. 255> for a cipher of your own.> C<1 .. 127> is reserved
+for built-ins, used or not, and L</cipher_self_check> refuses an id in that
+range that no built-in has yet taken -- claiming one would work perfectly today
+and collide with a future built-in, at which point the rows written under it
+become unreadable.
 
 Claiming one of the four ON PURPOSE is a legitimate thing to do -- a
 hardware-accelerated, audited or vendored implementation of the same algorithm
@@ -305,6 +342,22 @@ configured key against C<key_bytes>, draws C<iv_bytes> from
 L<Crypt::PRNG|CryptX> for every write, and uses C<tag_bytes> to find the
 boundaries when reading a row back, so all three must be constant for a given
 C<cipher_id>.
+
+=head2 It must actually encrypt
+
+L</cipher_self_check> compares the ciphertext against the plaintext and refuses
+a cipher that returns the plaintext unchanged.
+
+This is worth stating because every other check in that method tests
+B<authentication>: that the tag is real, that altered input is refused, that the
+additional data is bound in. A cipher that computes a sound MAC over the
+plaintext and then hands back the plaintext as its ciphertext passes all of
+them. It round trips, it refuses every forgery -- and it writes sessions to the
+database in the clear.
+
+That is not a contrived shape. It is what an encrypt-then-MAC implementation
+becomes if its author returns the wrong variable, and nothing about the result
+looks wrong from outside.
 
 =head2 seal
 
