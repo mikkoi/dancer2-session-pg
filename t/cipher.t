@@ -92,7 +92,7 @@ my %EXPECTED = (
 
     sub unseal {                                                                            ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
         my ( $s, $k, $i, $c, $t, $aad ) = @_;
-        return if !defined $t || $t ne _tag( $c, $aad );
+        return () if !defined $t || $t ne _tag( $c, $aad );
         return $c;
     }
     with 'Dancer2::Session::Pg::Cipher';
@@ -124,7 +124,7 @@ my %EXPECTED = (
 
     sub unseal {                                        ## no critic (Subroutines::ProhibitManyArgs) -- six is the AEAD contract in Dancer2::Session::Pg::Cipher
         my ( $s, $k, $i, $c, $t, $aad ) = @_;
-        return
+        return ()
           if !defined $t || $t ne Test::Cipher::Base::_tag($c);    ## no critic (Subroutines::ProtectPrivateSubs) -- the format and the crypto live here, so they are tested directly
         return $c;
     }

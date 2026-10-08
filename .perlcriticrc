@@ -92,13 +92,6 @@ exclude = Documentation ValuesAndExpressions::ProhibitConstantPragma
 # would make the guards harder to pick out, not easier.
 [-ControlStructures::ProhibitPostfixControls]
 
-# Wants `return undef` or `return ()` in place of a bare `return;`. Here the
-# bare form is load-bearing: _decrypt, _retrieve and _principal_of are called in
-# both scalar and list context and must yield undef or an empty list
-# accordingly. One of the ten was a genuine fragility and has been fixed at the
-# call site in _flush; the rest are correct as they stand.
-[-Community::EmptyReturn]
-
 # The test support modules under t/lib, and the packages declared inside test
 # files. A $VERSION on a package that exists only to be exercised by the file it
 # sits in would be noise; nothing installs or indexes them.

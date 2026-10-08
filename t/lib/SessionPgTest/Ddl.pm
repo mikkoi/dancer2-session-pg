@@ -35,7 +35,7 @@ sub ddl_from_pod {
     my ($body) = $pod =~ m/^=head2[ ]\Q$section\E[ ]*\n(.*?)(?=^=head[12][ ])/msx;
     if ( !defined $body ) {
         $REASON = "no =head2 '$section' in $MODULE";
-        return;
+        return ();
     }
 
     # Verbatim paragraphs are the indented lines; prose starts at column 0.
@@ -70,11 +70,11 @@ sub apply {
     my ( $dbh, $schema, $section ) = @_;
 
     my $ddl = ddl_from_pod($section);
-    return if !defined $ddl;
+    return () if !defined $ddl;
 
     if ( $ddl !~ m/CREATE[ ]TABLE/msx ) {
         $REASON = "=head2 '$section' yielded no CREATE TABLE";
-        return;
+        return ();
     }
 
     $ddl =~ s/\bweb[.]/$schema./msxg;

@@ -31,7 +31,7 @@ sub provision {
 
     if ( system( 'createdb', $name ) != 0 ) {
         $REASON = 'createdb failed: no reachable PostgreSQL cluster where this user may create databases';
-        return;
+        return ();
     }
 
     # RaiseError is on, so this THROWS on failure -- and at this point createdb
@@ -47,7 +47,7 @@ sub provision {
         $why =~ s/\s+\z//msx;
         system 'dropdb', '--if-exists', $name;    # nothing is registered yet, so drop it here
         $REASON = "created database '$name' but could not connect to it: $why";
-        return;
+        return ();
     }
 
     if ( $ENV{'SESSION_PG_TEST_KEEP_DB'} ) {

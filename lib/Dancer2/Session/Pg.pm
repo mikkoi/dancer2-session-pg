@@ -491,7 +491,7 @@ sub _principal_of {
               . ' reference rather than a value, so '
               . 'the principal column was left NULL. Sessions written this way cannot be found '
               . 'by destroy_for_principal. Give principal_key a coderef that returns one scalar.' );
-        return;
+        return ();
     }
 
     return $value;
@@ -599,7 +599,7 @@ sub _encrypt {
 
 sub _decrypt {
     my ( $self, $id, $blob ) = @_;
-    return if !defined $blob || length $blob < HEADER_BYTES;
+    return () if !defined $blob || length $blob < HEADER_BYTES;
 
     my ( $version, $cipher_id, $key_id ) = unpack 'C3', $blob;
 
@@ -632,7 +632,7 @@ sub _decrypt {
 
     my $tag_at  = HEADER_BYTES + $cipher->iv_bytes;
     my $body_at = $tag_at + $cipher->tag_bytes;
-    return if length $blob <= $body_at;
+    return () if length $blob <= $body_at;
 
     my $plain = eval {
         $cipher->unseal(
@@ -671,7 +671,7 @@ sub _retrieve {    ## no critic (Subroutines::ProhibitUnusedPrivateSubroutines) 
       $self->_dbh->selectrow_arrayref( "SELECT session_data FROM $table WHERE id = ? AND (expires IS NULL OR expires > now())",
         undef, $self->_row_id($id), );
 
-    return if !$row;
+    return () if !$row;
     return $self->_decrypt( $id, $row->[0] );
 }
 
