@@ -1,6 +1,9 @@
 Revision history for Dancer2-Session-Pg
 
 {{$NEXT}}
+    * Name the option as it is: the log message for a row that fails
+      authentication, and the POD beside it, still said encryption_key.
+      The option is encryption_keys.
 
 0.001     2026-10-09 00:39:37+02:00 Europe/Stockholm
     * Import initial version.
