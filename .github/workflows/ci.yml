@@ -3,7 +3,7 @@ on:
   pull_request:
   push:
     branches:
-      - '*'
+      - main
   workflow_dispatch:
 
 jobs:
@@ -37,7 +37,32 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: perldocker/perl-tester:5.44
+    # Service containers to run with `container-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        # Provide the password for postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
+      - id: test-pg
+        name: Test Pg
+        run: PGPASSWORD=${POSTGRES_PASSWORD} psql --dbname ${POSTGRES_USERNAME} --host ${POSTGRES_HOST} --port ${POSTGRES_PORT} --username ${POSTGRES_USERNAME} -c 'SELECT current_timestamp;'
+        shell: bash
+        env:
+          # The hostname used to communicate with the PostgreSQL service container
+          POSTGRES_USERNAME: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST: postgres
+          POSTGRES_PORT: 5432
       - id: checkout
         name: Checkout
         uses: actions/checkout@v7.0.1
@@ -51,9 +76,18 @@ jobs:
       - id: install-deps
         name: Install deps
         run: cpan-install-dist-deps
+        env:
+          POSTGRES_USERNAME: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST: postgres
+          POSTGRES_PORT: 5432
       - id: test
         name: Test
         run: test-dist
         env:
           CODECOV_TOKEN: ${{secrets.CODECOV_TOKEN}}
           COVERALLS_TOKEN: ${{secrets.COVERALLS_REPO_TOKEN}}
+          POSTGRES_USERNAME: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST: postgres
+          POSTGRES_PORT: 5432
