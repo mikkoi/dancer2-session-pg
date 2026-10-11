@@ -6,7 +6,7 @@ use warnings;
 use Moo;
 use Crypt::AuthEnc::ChaCha20Poly1305 ();
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 with 'Dancer2::Session::Pg::Cipher';
 

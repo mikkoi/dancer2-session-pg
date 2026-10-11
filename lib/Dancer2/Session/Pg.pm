@@ -38,7 +38,7 @@ use constant {
     DEFAULT_STATEMENT_TIMEOUT_MS => 2000,
 };
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 with 'Dancer2::Core::Role::SessionFactory';
 
