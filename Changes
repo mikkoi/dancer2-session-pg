@@ -1,6 +1,7 @@
 Revision history for Dancer2-Session-Pg
 
 {{$NEXT}}
+    * Add Pg to GH Actions Linux workflow.
     * Reconfigure CI workflow and add Pg tests.
     * Remove Git::Hooks and Git::MoreHooks from Dev prereqs.
 
