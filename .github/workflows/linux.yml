@@ -3,8 +3,7 @@ name: linux
 on:
   pull_request:
   push:
-    branches:
-      - '*'
+    branches: [ 'main' ]
   workflow_dispatch:
 
 jobs:
@@ -38,10 +37,21 @@ jobs:
       # https://hub.docker.com/r/perldocker/perl-tester
       # https://github.com/Perl/docker-perl-tester
 
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - id: checkout
         name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
       - id: explore-tools-perl
         name: perl -V
         run: perl -V
@@ -54,6 +64,11 @@ jobs:
       #   run: cpm install -g --no-test --show-build-log-on-failure --cpanfile cpanfile
       # - name: Makefile.PL
       #   run: perl Makefile.PL
+      - id: pg-client
+        name: Install libpq and the client tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends libpq-dev postgresql-client
       - id: list-dzil-authordeps-with-verbosity
         name: List Dist::Zilla Author Dependencies With Verbosity
         run: |
