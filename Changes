@@ -1,6 +1,7 @@
 Revision history for Dancer2-Session-Pg
 
 {{$NEXT}}
+    * Reconfigure CI workflow and add Pg tests.
     * Remove Git::Hooks and Git::MoreHooks from Dev prereqs.
 
 0.001     2026-10-09 00:39:37+02:00 Europe/Stockholm
