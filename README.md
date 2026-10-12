@@ -203,7 +203,7 @@ have or does not define strongly enough to rely on.
 None of this rules out a portable session store -- it rules out a portable one
 with these properties. This one
 is for the case where the session store is the most security-sensitive table in
-the database, and you would want the database enforced that.
+the database, and you would want the database to enforce that.
 
 # REQUIREMENTS
 
