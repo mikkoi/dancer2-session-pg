@@ -1333,6 +1333,75 @@ reads it back, and the column's type and constraints are the database's business
 See L</DDL with the principal column as a foreign key> for the trade-offs
 spelled out.
 
+=head2 Storing a digest instead of the value
+
+The column is a clear copy, which is what makes it useful and is also the whole
+of what it gives away. A dump of the table names, per row, which principal held
+a session, when it was made and last touched, and how many that principal had
+at once. The payload stays sealed; this does not. For most applications that is
+the right trade -- it is what buys the foreign key and the indexed revoke -- but
+where the mere B<existence> of a session for a given principal is the sensitive
+fact, there is a third option beside free text and a foreign key.
+
+Store a keyed digest of the identifier rather than the identifier. A digest of
+this kind is deterministic, so every lookup this module performs is an equality
+match and keeps working untouched; and it is one way, so a dump names nobody.
+Nothing in the module needs changing, because C<principal_key> already takes a
+coderef, and C<Crypt::Mac::HMAC> arrives with the C<CryptX> this module already
+requires:
+
+    use Crypt::Mac::HMAC qw( hmac_hex );
+
+    principal_key => sub {
+        my ($data) = @_;
+        my $id = $data->{'account_id'};
+        return if !defined $id;          # no account yet: column stays NULL
+        return hmac_hex( 'SHA256', $principal_hmac_key, $id );
+    },
+
+The caller then asks the same question in the same form:
+
+    $engine->destroy_for_principal(
+        hmac_hex( 'SHA256', $principal_hmac_key, $account_id ) );
+
+L</count_sessions> is unaffected, because C<signed_in> counts rows whose column
+is not NULL and never looks at the value.
+
+What it costs, and none of it is small:
+
+=over 4
+
+=item *
+
+B<The foreign key goes.> A digest is not a key of any table, so C<ON DELETE
+CASCADE>, the write-time guarantee that the column means what it says, and
+everything else in L</Free text or a foreign key> under C<foreign key> are gone.
+What is left is the free-text column, with the typo that is just a session
+nobody can revoke.
+
+=item *
+
+B<You can no longer enumerate.> The column answers "does this principal have
+sessions?" and no longer "which principals do?", because answering the second
+needs a list of candidates to hash. Anything that listed accounts by reading
+this column stops working.
+
+=item *
+
+B<The key cannot rotate.> Rotating it does not orphan the sessions themselves --
+they are still destroyed by id and still expire -- but it does orphan the
+ability to find them by principal, which is the one thing the column is for.
+This is the same objection L</Why the session id is stored as a digest> makes
+against keying B<that> digest, in a milder form: a key that must not rotate,
+sitting beside keys that must. Decide where it lives and how it is backed up
+before the first session is written, because it cannot be recovered from the
+table afterwards.
+
+=back
+
+If none of that is worth it, leave the identifier in clear and treat the table
+as the credential material its own C<COMMENT ON TABLE> says it is.
+
 =head2 When it will do nothing for you
 
 =over 4
