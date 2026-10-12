@@ -1044,8 +1044,7 @@ it.
 
 =head2 Why this is PostgreSQL and not portable SQL
 
-A reasonable question, since a session row is four columns and a blob. The
-answer is that the three guarantees above are not properties of the schema --
+The three guarantees above are not properties of the schema --
 they are properties of statements and settings that standard SQL either does not
 have or does not define strongly enough to rely on.
 
@@ -1053,7 +1052,7 @@ have or does not define strongly enough to rely on.
 
 =item C<INSERT ... ON CONFLICT DO UPDATE>, not C<MERGE>
 
-The standard spells an upsert C<MERGE>, PostgreSQL has had it since 15, and it
+The standard spells an upsert C<MERGE>, PostgreSQL has had it since version 15, and it
 is B<not a substitute here>. C<MERGE> decides between its C<WHEN MATCHED> and
 C<WHEN NOT MATCHED> branches from a snapshot; it does not take the speculative
 insertion lock that C<ON CONFLICT> does, so when two transactions pick the
@@ -1106,11 +1105,9 @@ PostgreSQL stores it as an instant rather than a local time with an offset.
 =back
 
 None of this rules out a portable session store -- it rules out a portable one
-with these properties. A session table meant to run on several engines is a
-reasonable thing to want, and it is a different module from this one. This one
+with these properties. This one
 is for the case where the session store is the most security-sensitive table in
-the database, and you would rather the database enforced that than your
-application remembered to.
+the database, and you would want the database enforced that.
 
 =head1 REQUIREMENTS
 
@@ -1123,18 +1120,15 @@ Perl B<v5.14> or later (Dancer2's required Perl as per L<Dancer2> B<v1.0.0>).
 
 =head1 THE TABLE
 
-Create it yourself. The DDL below is a starting point, not a mandate: schema
+Below are examples of possible alternatives.
+The DDL below is a starting point, not a mandate: schema
 name, ownership, tablespace, index names, whether C<IF NOT EXISTS> suits your
 deployment and whether the table joins an existing migration scheme are local
-decisions this module has no business making.
+decisions depending upon how your Dancer2 application works.
 
 Three things are actually required: the column B<names> and B<types> of the
 columns this module writes, C<id> unique so C<ON CONFLICT (id)> has an arbiter,
 and privilege to C<SELECT>, C<INSERT>, C<UPDATE> and C<DELETE>.
-
-Put the result under whatever migration scheme you already use. A session table
-that exists only in somebody's shell history disappears the next time the schema
-is rebuilt, and the symptom at the far end is a login that never completes.
 
 There are three variants below, and B<the second is the smallest thing that
 works>. Start there unless you know you want the principal column.
