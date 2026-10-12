@@ -20,7 +20,7 @@ PostgreSQL session backend for Dancer2
 
 # VERSION
 
-version 0.001
+version 0.003
 
 # STATUS
 
