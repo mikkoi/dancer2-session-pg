@@ -144,14 +144,13 @@ it.
 
 ## Why this is PostgreSQL and not portable SQL
 
-A reasonable question, since a session row is four columns and a blob. The
-answer is that the three guarantees above are not properties of the schema --
+The three guarantees above are not properties of the schema --
 they are properties of statements and settings that standard SQL either does not
 have or does not define strongly enough to rely on.
 
 - `INSERT ... ON CONFLICT DO UPDATE`, not `MERGE`
 
-    The standard spells an upsert `MERGE`, PostgreSQL has had it since 15, and it
+    The standard spells an upsert `MERGE`, PostgreSQL has had it since version 15, and it
     is **not a substitute here**. `MERGE` decides between its `WHEN MATCHED` and
     `WHEN NOT MATCHED` branches from a snapshot; it does not take the speculative
     insertion lock that `ON CONFLICT` does, so when two transactions pick the
@@ -202,11 +201,9 @@ have or does not define strongly enough to rely on.
     PostgreSQL stores it as an instant rather than a local time with an offset.
 
 None of this rules out a portable session store -- it rules out a portable one
-with these properties. A session table meant to run on several engines is a
-reasonable thing to want, and it is a different module from this one. This one
+with these properties. This one
 is for the case where the session store is the most security-sensitive table in
-the database, and you would rather the database enforced that than your
-application remembered to.
+the database, and you would want the database enforced that.
 
 # REQUIREMENTS
 
