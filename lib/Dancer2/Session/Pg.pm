@@ -916,7 +916,7 @@ Dancer2::Session::Pg - PostgreSQL session backend for Dancer2
 
 =head1 VERSION
 
-version 0.001
+version 0.003
 
 =head1 STATUS
 

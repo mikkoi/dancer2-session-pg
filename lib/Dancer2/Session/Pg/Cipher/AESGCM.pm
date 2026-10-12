@@ -61,7 +61,7 @@ Dancer2::Session::Pg::Cipher::AESGCM - AES-GCM for Dancer2::Session::Pg
 
 =head1 VERSION
 
-version 0.001
+version 0.003
 
 =head1 SYNOPSIS
 

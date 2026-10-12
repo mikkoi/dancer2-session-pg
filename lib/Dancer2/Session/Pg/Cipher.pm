@@ -209,7 +209,7 @@ Dancer2::Session::Pg::Cipher - the authenticated-cipher contract for Dancer2::Se
 
 =head1 VERSION
 
-version 0.001
+version 0.003
 
 =head1 SYNOPSIS
 

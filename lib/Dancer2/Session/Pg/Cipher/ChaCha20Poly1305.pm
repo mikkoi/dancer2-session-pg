@@ -40,7 +40,7 @@ Dancer2::Session::Pg::Cipher::ChaCha20Poly1305 - ChaCha20-Poly1305 for Dancer2::
 
 =head1 VERSION
 
-version 0.001
+version 0.003
 
 =head1 SYNOPSIS
 
